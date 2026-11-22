@@ -595,6 +595,20 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async transaction<T>(fn: () => Promise<T>): Promise<T> {
+      if (txStorage.getStore() !== undefined) {
+        const name = `sp_${randomUUID().replaceAll('-', '')}`;
+        db.exec(`SAVEPOINT ${name}`);
+        let nested: T;
+        try {
+          nested = await txStorage.run({ inside: true }, fn);
+        } catch (err) {
+          db.exec(`ROLLBACK TO ${name}`);
+          db.exec(`RELEASE ${name}`);
+          throw err;
+        }
+        db.exec(`RELEASE ${name}`);
+        return nested;
+      }
       return queue.enqueue(async () => {
         db.exec('BEGIN IMMEDIATE');
         let result: T;

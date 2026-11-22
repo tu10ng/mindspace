@@ -216,13 +216,13 @@ async function handlePostRevision(app: App, consId: string, body: unknown): Prom
 }
 
 async function handleActivate(app: App, consId: string): Promise<Record<string, unknown>> {
-  const cons = await app.store.getCons(consId);
-  if (cons === null) {
-    throw Object.assign(new Error(`cons ${consId} not found`), { code: 'unknown_reference' });
-  }
-  const revision = cons.currentRevision;
-  await app.store.transaction(async () => {
-    await activateConsInTx(app.store, consId, revision, { activatedBy: 'human-api' }, { methodBinding: true });
+  const revision = await app.store.transaction(async (): Promise<number> => {
+    const cons = await app.store.getCons(consId);
+    if (cons === null) {
+      throw Object.assign(new Error(`cons ${consId} not found`), { code: 'unknown_reference' });
+    }
+    await activateConsInTx(app.store, consId, cons.currentRevision, { activatedBy: 'human-api' }, { methodBinding: true });
+    return cons.currentRevision;
   });
   await app.store.appendEvent('human_cons_activated', { consId, revision }, null, null);
   return { consId, status: 'active', revision };

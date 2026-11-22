@@ -324,6 +324,17 @@ function validateOutputReferences(envelope: ExecutionEnvelope, output: unknown):
   return null;
 }
 
+async function validateArtifactTempIds(store: ConsStoreApi, output: unknown): Promise<ErrorCode | null> {
+  if (!isRecord(output) || !Array.isArray(output['artifacts'])) return null;
+  for (const art of output['artifacts']) {
+    if (isRecord(art) && typeof art['tempId'] === 'string' && art['tempId'] !== '') {
+      const cons = await store.getCons(art['tempId']);
+      if (cons !== null) return 'unauthorized_effect';
+    }
+  }
+  return null;
+}
+
 function buildEnvelope(
   run: Run,
   step: Step,
@@ -777,6 +788,10 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     const refCode = validateOutputReferences(envelope, output);
     if (refCode !== null) {
       return failRun(deps, run, step, refCode, `output reference validation failed: ${refCode}`);
+    }
+    const tempIdCode = await validateArtifactTempIds(deps.store, output);
+    if (tempIdCode !== null) {
+      return failRun(deps, run, step, tempIdCode, `output artifact validation failed: ${tempIdCode}`);
     }
     const transition = evaluateTransition(node, output, declaredTopLevelFields(actionSpec.outputSchema));
     if (transition.error !== undefined) {

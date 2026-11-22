@@ -91,4 +91,13 @@ describe('form primitive', () => {
     expect(rev?.provenance.source).toBe('llm');
     expect(await store.hasIdempotencyKey(`${ctx.step.id}:0`)).toBe(true);
   });
+
+  it('rejects candidates whose tempId collides with an existing cons id (tempId namespace)', async () => {
+    const ctx = makeCtx(store, {
+      candidates: [{ tempId: 'seed.decompose', kind: 'object', content: { title: '碰撞候选' } }],
+    });
+    await expect(createPrimitives()['form']?.run(ctx, ctx.step.id)).rejects.toThrow(
+      /unauthorized_effect: tempId "seed\.decompose" collides/,
+    );
+  });
 });

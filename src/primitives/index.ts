@@ -372,9 +372,27 @@ function ingestContentCompatible(spec: unknown): boolean {
   const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
   const inputRequired = Array.isArray(inputSchema['required']) ? inputSchema['required'] : [];
   if (!inputRequired.every((k) => k === 'input' || k === 'task')) return false;
+  if (isRecord(inputSchema['properties'])) {
+    const declared = Object.keys(inputSchema['properties']);
+    if (!declared.every((k) => k === 'input' || k === 'task')) return false;
+    if (inputSchema['additionalProperties'] === false && !(declared.includes('input') && declared.includes('task'))) {
+      return false;
+    }
+  }
   const outputSchema = isRecord(spec['outputSchema']) ? spec['outputSchema'] : {};
   const outRequired = Array.isArray(outputSchema['required']) ? outputSchema['required'] : [];
   return outRequired.includes('artifacts') && outRequired.includes('links');
+}
+
+export async function assertTempIdNamespace(store: ConsStoreApi, tempId: string): Promise<void> {
+  if (tempId === '') return;
+  const cons = await store.getCons(tempId);
+  if (cons !== null) {
+    throw new PrimitiveError(
+      'unauthorized_effect',
+      `unauthorized_effect: tempId "${tempId}" collides with an existing cons id`,
+    );
+  }
 }
 
 const KIND_ROLES: Record<string, ConsRole[]> = {
@@ -395,6 +413,7 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
     for (const c of candidates) {
       if (!isRecord(c)) continue;
       const tempId = asString(c['tempId'], '');
+      await assertTempIdNamespace(ctx.store, tempId);
       const kind = asString(c['kind'], 'object');
       const content = isRecord(c['content']) ? c['content'] : {};
       const key = `${ctx.step.id}:${String(opIndex)}`;
@@ -680,6 +699,7 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
   const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
   for (const f of formedRaw) {
     if (isRecord(f) && typeof f['tempId'] === 'string' && isRef(f['consRef'])) {
+      await assertTempIdNamespace(ctx.store, f['tempId']);
       tempMap.set(f['tempId'], f['consRef']);
       formed.push({ tempId: f['tempId'], consRef: f['consRef'] });
     }
@@ -793,9 +813,9 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
     if (createdEdgeRefs.length > 0) {
       await ctx.store.appendEvent('edges_created', { edges: createdEdgeRefs }, ctx.run.id, stepId);
     }
+    await ctx.store.putIdempotencyResult(connectResultKey(stepId), { connected: formed.map((f) => f.consRef), edges: edgeIds });
     return { connected: formed.map((f) => f.consRef), edges: edgeIds };
   });
-  await ctx.store.putIdempotencyResult(connectResultKey(stepId), output);
   return output;
 }
 

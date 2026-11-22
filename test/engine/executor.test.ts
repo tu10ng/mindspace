@@ -990,3 +990,29 @@ describe('F06 default method qualification at execution load', () => {
     expect((failed?.payload as { errorCode: string }).errorCode).toBe('missing_binding');
   });
 });
+
+describe('tempId namespace enforcement', () => {
+  it('rejects llm outputs whose artifact tempId collides with an existing cons id', async () => {
+    const llm = createMockLlm(() => ({
+      artifacts: [{ tempId: 'test.decompose', kind: 'object', content: { title: '碰撞对象' } }],
+      links: [],
+      executionSummary: '输出试图劫持真实 cons id 作为 tempId。',
+    }));
+    const { deps, store, runId } = await setupContentHarness(llm, true);
+    const run = await executeRun(deps, runId);
+    expect(run.status).toBe('failed');
+    const step = (await store.listSteps(runId)).find((s) => s.nodeId === 'n_dec');
+    expect(step?.errorCode).toBe('unauthorized_effect');
+  });
+
+  it('accepts artifact tempIds that do not collide with any cons id', async () => {
+    const llm = createMockLlm(() => ({
+      artifacts: [{ tempId: 'fresh-temp-1', kind: 'object', content: { title: '正常对象' } }],
+      links: [],
+      executionSummary: '正常输出。',
+    }));
+    const { deps, runId } = await setupContentHarness(llm, true);
+    const run = await executeRun(deps, runId);
+    expect(run.status).toBe('completed');
+  });
+});

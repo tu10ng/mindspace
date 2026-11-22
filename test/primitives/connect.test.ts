@@ -435,3 +435,156 @@ describe('connect primitive', () => {
     expect((await store.getCons(primRef.consId))?.status).toBe('draft');
   });
 });
+
+describe('tempId namespace and structured temp rewrite', () => {
+  it('rejects formed tempIds that collide with existing cons ids and leaves specs intact', async () => {
+    const method = await formOne('method', {
+      title: '受控命名空间方法',
+      instructions: 'use zz carefully',
+      spec: { kind: 'method', actionId: 'seed.decompose', instructions: 'use zz carefully', applicabilityText: 'zz' },
+    }, 'zz');
+    await expect(
+      connect({ formed: [{ tempId: 'seed.decompose', consRef: method }], activate: true }),
+    ).rejects.toThrow(/unauthorized_effect: tempId "seed\.decompose" collides/);
+    const seededConnect = createSeedPrimitives()['connect'];
+    const ctx = makeCtx(store, { formed: [{ tempId: 'seed.decompose', consRef: method }], activate: true });
+    await expect(seededConnect?.run(ctx, ctx.step.id)).rejects.toThrow(/unauthorized_effect/);
+    const cons = await store.getCons(method.consId);
+    expect(cons?.currentRevision).toBe(1);
+    expect(cons?.status).toBe('draft');
+    const seedMethodCons = await store.getCons('seed.decompose.default');
+    expect(seedMethodCons?.currentRevision).toBe(1);
+    const seedMethodRev = await store.getRevision('seed.decompose.default', 1);
+    expect((seedMethodRev?.spec as { actionId?: string } | undefined)?.actionId).toBe('seed.decompose');
+  });
+
+  it('rewrites temp refs only on declared spec field paths (method.actionId, action.defaultMethodId)', async () => {
+    const method = await formOne('method', {
+      title: '局部改写方法',
+      instructions: 'zz',
+      spec: { kind: 'method', actionId: 'seed.classify', instructions: 'zz', applicabilityText: 'zz' },
+    }, 'zz');
+    const obj = await formOne('object', { title: '改写目标对象' }, 'zz2');
+    const seededConnect = createSeedPrimitives()['connect'];
+    const ctx = makeCtx(store, {
+      formed: [
+        { tempId: 'zz', consRef: method },
+        { tempId: 'zz2', consRef: obj },
+      ],
+      activate: true,
+    });
+    const out = (await seededConnect?.run(ctx, ctx.step.id)) as { connected: ConsRef[] };
+    expect(out.connected[0]?.revision).toBe(1);
+    const rev = await store.getRevision(method.consId, 1);
+    expect(rev?.spec).toMatchObject({ kind: 'method', actionId: 'seed.classify' });
+    expect((rev?.spec as { instructions?: string; applicabilityText?: string } | undefined)?.instructions).toBe('zz');
+    expect((rev?.spec as { applicabilityText?: string } | undefined)?.applicabilityText).toBe('zz');
+  });
+
+  it('rewrites tendency preferIds and avoidIds temp refs', async () => {
+    const tendency = await formOne('tendency', {
+      title: '倾向改写',
+      spec: {
+        kind: 'tendency',
+        scope: 'action_selection',
+        applicabilityText: '',
+        preferenceText: '',
+        preferIds: ['p1'],
+        avoidIds: [],
+      },
+    }, 't1');
+    const preferred = await formOne('object', { title: '倾向偏好对象' }, 'p1');
+    const ctx = makeCtx(store, {
+      formed: [
+        { tempId: 't1', consRef: tendency },
+        { tempId: 'p1', consRef: preferred },
+      ],
+      activate: true,
+    });
+    const out = (await createSeedPrimitives()['connect']?.run(ctx, ctx.step.id)) as { connected: ConsRef[] };
+    expect(out.connected[0]?.revision).toBe(2);
+    const rev = await store.getRevision(tendency.consId, 2);
+    expect((rev?.spec as { preferIds?: string[] } | undefined)?.preferIds).toEqual([preferred.consId]);
+  });
+});
+
+describe('connect idempotency atomicity', () => {
+  it('writes the idempotency result inside the effect transaction: crash replay creates no duplicate edges', async () => {
+    const a = await formOne('object', { title: '崩溃甲' }, 'a');
+    const b = await formOne('object', { title: '崩溃乙' }, 'b');
+    const ctx = makeCtx(store, {
+      formed: [
+        { tempId: 'a', consRef: a },
+        { tempId: 'b', consRef: b },
+      ],
+      edges: [{ from: 'a', relationConsId: 'rel.describes', to: 'b' }],
+      activate: true,
+    });
+    const realPut = store.putIdempotencyResult.bind(store);
+    let armed = true;
+    store.putIdempotencyResult = async (key: string, result: unknown): Promise<void> => {
+      await realPut(key, result);
+      if (armed && key.endsWith(':connect')) {
+        armed = false;
+        throw new Error('injected crash after key write');
+      }
+    };
+    await expect(createPrimitives()['connect']?.run(ctx, ctx.step.id)).rejects.toThrow('injected crash after key write');
+    store.putIdempotencyResult = realPut;
+    expect(await store.listEdges(a.consId, 'both', false)).toEqual([]);
+    expect((await store.getCons(a.consId))?.status).toBe('draft');
+    expect(await store.getIdempotencyResult(`${ctx.step.id}:connect`)).toBeNull();
+    const replay = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[]; connected: ConsRef[] };
+    expect(replay.edges).toHaveLength(1);
+    expect((await store.listEdges(a.consId, 'both', false)).length).toBe(1);
+    expect((await store.getCons(a.consId))?.status).toBe('active');
+    const again = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[]; connected: ConsRef[] };
+    expect(again).toEqual(replay);
+    expect((await store.listEdges(a.consId, 'both', false)).length).toBe(1);
+  });
+
+  it('keeps the temp-rewrite revision inside the connect transaction: crash replay does not stack revisions', async () => {
+    const method = await formOne('method', {
+      title: '改写崩溃方法',
+      instructions: 'x',
+      spec: { kind: 'method', actionId: 'x1', instructions: 'x', applicabilityText: '' },
+    }, 'm');
+    const ref = await formOne('action', {
+      title: '改写崩溃动作',
+      spec: {
+        kind: 'action',
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        executor: 'llm',
+        allowedEffects: ['return_artifacts'],
+        freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
+        defaultMethodId: 'm',
+      },
+    }, 'x1');
+    const ctx = makeCtx(store, {
+      formed: [
+        { tempId: 'm', consRef: method },
+        { tempId: 'x1', consRef: ref },
+      ],
+      activate: true,
+    });
+    const seededConnect = createSeedPrimitives()['connect'];
+    const realPut = store.putIdempotencyResult.bind(store);
+    let armed = true;
+    store.putIdempotencyResult = async (key: string, result: unknown): Promise<void> => {
+      await realPut(key, result);
+      if (armed && key.endsWith(':connect')) {
+        armed = false;
+        throw new Error('injected crash after key write');
+      }
+    };
+    await expect(seededConnect?.run(ctx, ctx.step.id)).rejects.toThrow('injected crash after key write');
+    store.putIdempotencyResult = realPut;
+    expect((await store.getCons(method.consId))?.currentRevision).toBe(1);
+    expect((await store.getCons(ref.consId))?.currentRevision).toBe(1);
+    const out = (await seededConnect?.run(ctx, ctx.step.id)) as { connected: ConsRef[] };
+    expect(out.connected.every((c) => c.revision === 2)).toBe(true);
+    expect((await store.getCons(method.consId))?.currentRevision).toBe(2);
+    expect((await store.getRevision(method.consId, 2))?.spec).toMatchObject({ kind: 'method', actionId: ref.consId });
+  });
+});

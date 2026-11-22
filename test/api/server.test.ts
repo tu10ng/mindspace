@@ -264,3 +264,53 @@ describe('cons endpoints', () => {
     expect(activated.status).toBe('active');
   });
 });
+
+describe('POST /cons/:id/activate transaction scope', () => {
+  it('reads currentRevision inside the activation transaction (TOCTOU)', async () => {
+    const created = await (await fetch(`${base}/cons`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        title: '事务读取方法',
+        roles: ['method'],
+        body: '激活读取必须在事务内。',
+        spec: { kind: 'method', actionId: 'seed.decompose', instructions: '激活读取必须在事务内。', applicabilityText: '' },
+      }),
+    })).json() as { id: string };
+    const consId = created.id;
+    const realTx = app.store.transaction.bind(app.store);
+    const realGetCons = app.store.getCons.bind(app.store);
+    let inTx = false;
+    let sawGetConsInTx = false;
+    app.store.transaction = async <T,>(fn: () => Promise<T>): Promise<T> =>
+      realTx(async () => {
+        inTx = true;
+        try {
+          return await fn();
+        } finally {
+          inTx = false;
+        }
+      });
+    app.store.getCons = (id: string) => {
+      if (inTx && id === consId) sawGetConsInTx = true;
+      return realGetCons(id);
+    };
+    try {
+      const res = await fetch(`${base}/cons/${consId}/activate`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      const body = await res.json() as { status: string; revision: number };
+      expect(body.status).toBe('active');
+      expect(body.revision).toBe(1);
+    } finally {
+      app.store.transaction = realTx;
+      app.store.getCons = realGetCons;
+    }
+    expect(sawGetConsInTx).toBe(true);
+  });
+
+  it('still returns 404 when the cons does not exist', async () => {
+    const res = await fetch(`${base}/cons/no-such-cons/activate`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { errorCode: string }).errorCode).toBe('unknown_reference');
+  });
+});

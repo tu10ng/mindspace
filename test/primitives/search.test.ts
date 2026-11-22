@@ -175,4 +175,66 @@ describe('search primitive', () => {
     const out = await createPrimitives()['search']?.run(ctx, ctx.step.id);
     expect(out).toEqual({ tendencyRefs: [{ consId: 'tendency.case_before_method', revision: 1 }] });
   });
+
+  it('contentActionsOnly excludes actions whose input schema declares keys outside {input, task} (F11)', async () => {
+    await store.createCons({
+      consId: 'f11.text-action',
+      title: '文本键动作',
+      roles: ['action'],
+      body: '',
+      aliases: [],
+      searchTerms: [],
+      spec: {
+        kind: 'action',
+        inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: [] },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            artifacts: { type: 'array' },
+            links: { type: 'array' },
+          },
+          required: ['artifacts', 'links'],
+        },
+        executor: 'llm',
+        allowedEffects: ['return_artifacts'],
+        freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
+      },
+      provenance: { source: 'human', sourceRefs: [] },
+    }, { stableId: 'f11.text-action' });
+    await store.setStatus('f11.text-action', 'active');
+    const unfiltered = await runSearch({ queries: [{ text: '文本键动作', roles: ['action'] }] });
+    expect(unfiltered.items.some((i) => i.ref.consId === 'f11.text-action')).toBe(true);
+    const filtered = await runSearch({ queries: [{ text: '文本键动作', roles: ['action'] }], contentActionsOnly: true });
+    expect(filtered.items.some((i) => i.ref.consId === 'f11.text-action')).toBe(false);
+  });
+
+  it('contentActionsOnly excludes actions that close the schema without declaring input and task (F11)', async () => {
+    await store.createCons({
+      consId: 'f11.closed-action',
+      title: '封闭键动作',
+      roles: ['action'],
+      body: '',
+      aliases: [],
+      searchTerms: [],
+      spec: {
+        kind: 'action',
+        inputSchema: { type: 'object', properties: { input: {} }, required: [], additionalProperties: false },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            artifacts: { type: 'array' },
+            links: { type: 'array' },
+          },
+          required: ['artifacts', 'links'],
+        },
+        executor: 'llm',
+        allowedEffects: ['return_artifacts'],
+        freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
+      },
+      provenance: { source: 'human', sourceRefs: [] },
+    }, { stableId: 'f11.closed-action' });
+    await store.setStatus('f11.closed-action', 'active');
+    const filtered = await runSearch({ queries: [{ text: '封闭键动作', roles: ['action'] }], contentActionsOnly: true });
+    expect(filtered.items.some((i) => i.ref.consId === 'f11.closed-action')).toBe(false);
+  });
 });
