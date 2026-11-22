@@ -60,6 +60,7 @@ export interface FlowNode {
   actionId?: string;
   actionFrom?: string;
   allowedActionIds?: string[];
+  contentActionsOnly?: boolean;
   inputBindings: Record<string, Binding>;
   outputKey: string;
   next?: string;
@@ -130,6 +131,14 @@ export interface MethodBinding {
   methodId: string;
   methodRevision: number;
   active: boolean;
+}
+
+export interface RunAuthorization {
+  stepId: string;
+  consId: string;
+  revision: number;
+  title: string;
+  candidates: ConsRef[];
 }
 
 export interface RunBudget {

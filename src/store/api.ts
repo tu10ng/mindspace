@@ -1,6 +1,6 @@
 import type {
   Cons, ConsRef, ConsRevision, ConsEdge, ExecutionBinding, MethodBinding,
-  Run, Step, EventRecord, SearchQuery, SearchResponse, ConsRole, ConsStatus,
+  Run, RunAuthorization, Step, EventRecord, SearchQuery, SearchResponse, ConsRole, ConsStatus,
 } from '../types.js';
 import type { LlmAttemptRow } from '../engine/llm_log.js';
 
@@ -14,6 +14,7 @@ export interface ConsStoreApi {
 
   createEdge(edge: Omit<ConsEdge, 'id'>): Promise<ConsEdge>;
   listEdges(consId: string, direction?: 'from' | 'to' | 'both', onlyActive?: boolean): Promise<ConsEdge[]>;
+  archiveEdge(edgeId: string): Promise<void>;
 
   upsertExecutionBinding(b: Omit<ExecutionBinding, 'active'> & { active: boolean }): Promise<void>;
   getActiveExecutionBinding(consId: string): Promise<ExecutionBinding | null>;
@@ -26,13 +27,17 @@ export interface ConsStoreApi {
 
   setMethodBinding(actionId: string, methodId: string, methodRevision: number, active: boolean): Promise<void>;
   listActiveMethodBindings(actionId: string): Promise<MethodBinding[]>;
+  deactivateMethodBindingsForMethod(methodId: string, keepActionId?: string): Promise<void>;
 
   createRun(run: Run): Promise<void>;
   updateRun(runId: string, patch: Partial<Pick<Run, 'status' | 'counters' | 'state'>>): Promise<void>;
   getRun(runId: string): Promise<Run | null>;
+  putRunAuthorization(runId: string, key: string, record: RunAuthorization): Promise<void>;
+  getRunAuthorization(runId: string, key: string): Promise<RunAuthorization | null>;
 
   upsertStep(step: Step): Promise<void>;
   getStep(runId: string, nodeId: string): Promise<Step | null>;
+  getStepById(stepId: string): Promise<Step | null>;
   listSteps(runId: string): Promise<Step[]>;
 
   appendEvent(eventType: string, payload: unknown, runId?: string | null, stepId?: string | null): Promise<void>;

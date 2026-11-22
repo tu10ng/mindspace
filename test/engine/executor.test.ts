@@ -551,18 +551,26 @@ describe('§5.1 actionFrom revision pinning', () => {
       },
     });
     const run = makeRun('run-drift', flowRef, 't');
-    run.state = {
-      pick: { consId: 'test.pick', revision: 1, authorized: true },
-      _authorizations: {
-        pick: {
-          consId: 'test.pick',
-          revision: 1,
-          title: 'test.pick',
-          candidates: [{ consId: 'test.pick', revision: 1 }],
-        },
-      },
-    };
+    run.state = { pick: { consId: 'test.pick', revision: 1, authorized: true } };
     await store.createRun(run);
+    await store.upsertStep({
+      id: 'run-drift::n_seed',
+      runId: 'run-drift',
+      nodeId: 'n_seed',
+      actionRef: { consId: 'test.select', revision: 1 },
+      tendencyRefs: [],
+      input: {},
+      status: 'succeeded',
+      output: { status: 'selected', selected: { consId: 'test.pick', revision: 1 } },
+      llmAttemptCount: 0,
+    });
+    await store.putRunAuthorization('run-drift', 'pick', {
+      stepId: 'run-drift::n_seed',
+      consId: 'test.pick',
+      revision: 1,
+      title: 'test.pick',
+      candidates: [{ consId: 'test.pick', revision: 1 }],
+    });
     const captured: Array<{ revision: number; body: string }> = [];
     const primitives = {
       noop: {

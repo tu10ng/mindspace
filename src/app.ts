@@ -38,7 +38,15 @@ export async function createApp(opts: AppOptions): Promise<App> {
     if (cons === null) {
       throw new Error(`unknown flow ${flowId}`);
     }
-    const state: Record<string, unknown> = isRecord(input) ? { input } : { input: { value: input } };
+    const filteredInput: Record<string, unknown> = {};
+    if (isRecord(input)) {
+      for (const [k, v] of Object.entries(input)) {
+        if (!k.startsWith('_')) {
+          filteredInput[k] = v;
+        }
+      }
+    }
+    const state: Record<string, unknown> = isRecord(input) ? { input: filteredInput } : { input: { value: input } };
     const run: Run = {
       id: randomUUID(),
       entryFlowRef: { consId: flowId, revision: cons.currentRevision },

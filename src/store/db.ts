@@ -198,6 +198,23 @@ const MIGRATIONS: Migration[] = [
       db.exec('UPDATE cons SET active_revision = current_revision');
     },
   },
+  {
+    version: 4,
+    name: 'run_authorizations',
+    apply: (db) => {
+      db.exec(`CREATE TABLE run_authorizations (
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  key TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  cons_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  candidates_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, key)
+)`);
+    },
+  },
 ];
 
 export function openDb(path: string): StoreDb {

@@ -222,9 +222,9 @@ async function handleActivate(app: App, consId: string): Promise<Record<string, 
       throw Object.assign(new Error(`cons ${consId} not found`), { code: 'unknown_reference' });
     }
     await activateConsInTx(app.store, consId, cons.currentRevision, { activatedBy: 'human-api' }, { methodBinding: true });
+    await app.store.appendEvent('human_cons_activated', { consId, revision: cons.currentRevision }, null, null);
     return cons.currentRevision;
   });
-  await app.store.appendEvent('human_cons_activated', { consId, revision }, null, null);
   return { consId, status: 'active', revision };
 }
 

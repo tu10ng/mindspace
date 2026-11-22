@@ -572,12 +572,10 @@ const flowIngest: FlowSpec = {
     },
     search_actions: {
       actionId: 'seed.search',
-      allowedActionIds: ['seed.decompose', 'seed.classify', 'seed.reference_case'],
       inputBindings: {
         queries: { source: 'state', path: 'actionQuery.queries' },
         roles: { source: 'literal', value: ['action'] },
         anchorIds: { source: 'state', path: 'actionQuery.anchorIds' },
-        allowedActionIds: { source: 'literal', value: ['seed.decompose', 'seed.classify', 'seed.reference_case'] },
         contentActionsOnly: { source: 'literal', value: true },
       },
       outputKey: 'actionCandidates',
@@ -638,6 +636,7 @@ const flowIngest: FlowSpec = {
     },
     execute_action: {
       actionFrom: 'actionSelection',
+      contentActionsOnly: true,
       inputBindings: {
         input: { source: 'state', path: 'inputCons' },
         task: { source: 'run', path: 'task' },

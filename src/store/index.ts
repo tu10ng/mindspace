@@ -12,6 +12,7 @@ import type {
   ExecutionBinding,
   MethodBinding,
   Run,
+  RunAuthorization,
   SearchQuery,
   SearchResponse,
   Step,
@@ -27,10 +28,12 @@ import {
 
 type Row = Record<string, unknown>;
 
-const txStorage = new AsyncLocalStorage<{ inside: true }>();
-
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function unknownReference(message: string): Error {
+  return Object.assign(new Error(message), { code: 'unknown_reference' });
 }
 
 function rowToCons(row: Row): Cons {
@@ -143,6 +146,7 @@ export function openStore(path: string): ConsStoreApi {
   const ctx: StoreDb = openDb(path);
   const db = ctx.db;
   const queue: WriteQueue = createWriteQueue();
+  const txStorage = new AsyncLocalStorage<{ inside: true }>();
 
   function write<T>(fn: () => T): Promise<T> {
     if (txStorage.getStore() !== undefined) {
@@ -298,6 +302,15 @@ export function openStore(path: string): ConsStoreApi {
 
     async createEdge(edge) {
       return write(() => {
+        for (const ref of [edge.from, edge.to]) {
+          if (!Number.isInteger(ref.revision) || ref.revision < 1) {
+            throw unknownReference(`unknown_reference: edge endpoint ${ref.consId}@${String(ref.revision)} has an invalid revision`);
+          }
+          const rev = db.prepare('SELECT 1 FROM cons_revisions WHERE cons_id = ? AND revision = ?').get(ref.consId, ref.revision);
+          if (rev === undefined) {
+            throw unknownReference(`unknown_reference: edge endpoint revision ${ref.consId}@${String(ref.revision)} not found`);
+          }
+        }
         const id = randomUUID();
         db.prepare(
           `INSERT INTO cons_edges (id, from_id, from_revision, relation_cons_id, to_id, to_revision, status, created_by_step_id)
@@ -341,6 +354,12 @@ export function openStore(path: string): ConsStoreApi {
         const where = `(${clauses.join(' OR ')})${active ? " AND status = 'active'" : ''}`;
         const rows = db.prepare(`SELECT * FROM cons_edges WHERE ${where} ORDER BY id`).all(...params) as Row[];
         return rows.map(rowToEdge);
+      });
+    },
+
+    async archiveEdge(edgeId) {
+      return write(() => {
+        db.prepare("UPDATE cons_edges SET status = 'archived' WHERE id = ?").run(edgeId);
       });
     },
 
@@ -429,6 +448,16 @@ export function openStore(path: string): ConsStoreApi {
       );
     },
 
+    async deactivateMethodBindingsForMethod(methodId, keepActionId) {
+      return write(() => {
+        if (keepActionId === undefined) {
+          db.prepare('UPDATE method_bindings SET active = 0 WHERE method_id = ? AND active = 1').run(methodId);
+          return;
+        }
+        db.prepare('UPDATE method_bindings SET active = 0 WHERE method_id = ? AND active = 1 AND action_id <> ?').run(methodId, keepActionId);
+      });
+    },
+
     async createRun(run) {
       return write(() => {
         db.prepare(
@@ -480,6 +509,36 @@ export function openStore(path: string): ConsStoreApi {
       );
     },
 
+    async putRunAuthorization(runId, key, record) {
+      return write(() => {
+        db.prepare(
+          `INSERT INTO run_authorizations (run_id, key, step_id, cons_id, revision, title, candidates_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (run_id, key) DO UPDATE SET
+             step_id = excluded.step_id,
+             cons_id = excluded.cons_id,
+             revision = excluded.revision,
+             title = excluded.title,
+             candidates_json = excluded.candidates_json`,
+        ).run(runId, key, record.stepId, record.consId, record.revision, record.title, JSON.stringify(record.candidates), nowIso());
+      });
+    },
+
+    async getRunAuthorization(runId, key) {
+      return write(() => db
+        .prepare('SELECT * FROM run_authorizations WHERE run_id = ? AND key = ?')
+        .get(runId, key) as Row | undefined).then((row) => {
+        if (row === undefined) return null;
+        return {
+          stepId: row.step_id as string,
+          consId: row.cons_id as string,
+          revision: row.revision as number,
+          title: row.title as string,
+          candidates: JSON.parse(row.candidates_json as string) as ConsRef[],
+        };
+      });
+    },
+
     async upsertStep(step) {
       return write(() => {
         db.prepare(
@@ -510,6 +569,12 @@ export function openStore(path: string): ConsStoreApi {
       return write(() => db
         .prepare('SELECT * FROM steps WHERE run_id = ? AND node_id = ? ORDER BY rowid DESC LIMIT 1')
         .get(runId, nodeId) as Row | undefined).then((row) => (row === undefined ? null : rowToStep(row)));
+    },
+
+    async getStepById(stepId) {
+      return write(() => db.prepare('SELECT * FROM steps WHERE id = ?').get(stepId) as Row | undefined).then((row) =>
+        row === undefined ? null : rowToStep(row),
+      );
     },
 
     async listSteps(runId) {

@@ -32,6 +32,8 @@ export function validateFlow(spec: FlowSpec): string[] {
     }
     if (typeof node.outputKey !== 'string' || node.outputKey.length === 0) {
       errors.push(`node "${id}": outputKey must be a non-empty string`);
+    } else if (node.outputKey.startsWith('_')) {
+      errors.push(`node "${id}": outputKey "${node.outputKey}" is reserved and must not start with "_"`);
     }
     if (node.next !== undefined) {
       if (typeof node.next !== 'string' || !(node.next in nodes)) {

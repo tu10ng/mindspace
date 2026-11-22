@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   ActionSpec,
   Cons,
+  ConsEdge,
   ConsRef,
   ConsRevision,
   ConsRole,
@@ -14,7 +15,7 @@ import type {
 import type { ConsStoreApi } from '../store/api.js';
 import type { PrimitiveFn, StepContext } from '../engine/executor.js';
 import { validateFlow } from '../engine/flow.js';
-import { findUnsupportedKeywords } from '../schema.js';
+import { findUnsupportedKeywords, validateSchemaStructure } from '../schema.js';
 
 export const REL_METHOD_OF = 'rel.method_of';
 export const REL_USED_METHOD = 'rel.used_method';
@@ -360,28 +361,62 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
     const filtered: SearchResultItem[] = [];
     for (const item of items) {
       const rev = await ctx.store.getRevision(item.ref.consId, item.ref.revision);
-      if (rev !== null && ingestContentCompatible(rev.spec)) filtered.push(item);
+      if (rev !== null && isContentActionCompatible(rev.spec)) filtered.push(item);
     }
     items = filtered;
   }
   return { items };
 }
 
-function ingestContentCompatible(spec: unknown): boolean {
+function isObjectType(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (typeof value === 'string') return value === 'object';
+  if (Array.isArray(value)) return value.length > 0 && value.every((t) => t === 'object');
+  return false;
+}
+
+function isStringType(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (typeof value === 'string') return value === 'string';
+  if (Array.isArray(value)) return value.length > 0 && value.every((t) => t === 'string');
+  return false;
+}
+
+function isArrayType(value: unknown): boolean {
+  if (value === undefined) return false;
+  if (typeof value === 'string') return value === 'array';
+  if (Array.isArray(value)) return value.length > 0 && value.every((t) => t === 'array');
+  return false;
+}
+
+export function isContentActionCompatible(spec: unknown): boolean {
   if (!isRecord(spec) || spec['kind'] !== 'action' || spec['executor'] !== 'llm') return false;
   const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
+  const inputProperties = isRecord(inputSchema['properties']) ? inputSchema['properties'] : null;
   const inputRequired = Array.isArray(inputSchema['required']) ? inputSchema['required'] : [];
   if (!inputRequired.every((k) => k === 'input' || k === 'task')) return false;
-  if (isRecord(inputSchema['properties'])) {
-    const declared = Object.keys(inputSchema['properties']);
+  if (inputProperties !== null) {
+    const declared = Object.keys(inputProperties);
     if (!declared.every((k) => k === 'input' || k === 'task')) return false;
     if (inputSchema['additionalProperties'] === false && !(declared.includes('input') && declared.includes('task'))) {
       return false;
     }
+    for (const [key, check] of [['input', isObjectType], ['task', isStringType]] as const) {
+      const sub = inputProperties[key];
+      if (sub !== undefined && !check(isRecord(sub) ? sub['type'] : undefined)) return false;
+    }
   }
   const outputSchema = isRecord(spec['outputSchema']) ? spec['outputSchema'] : {};
   const outRequired = Array.isArray(outputSchema['required']) ? outputSchema['required'] : [];
-  return outRequired.includes('artifacts') && outRequired.includes('links');
+  if (!outRequired.includes('artifacts') || !outRequired.includes('links')) return false;
+  const outProperties = isRecord(outputSchema['properties']) ? outputSchema['properties'] : null;
+  if (outProperties !== null) {
+    for (const key of ['artifacts', 'links']) {
+      const sub = outProperties[key];
+      if (sub !== undefined && !isArrayType(isRecord(sub) ? sub['type'] : undefined)) return false;
+    }
+  }
+  return true;
 }
 
 export async function assertTempIdNamespace(store: ConsStoreApi, tempId: string): Promise<void> {
@@ -491,12 +526,15 @@ async function validateActionFiveElements(store: ConsStoreApi, rev: ConsRevision
   if (missing.length > 0) {
     throw new PrimitiveError('schema_mismatch', `schema_mismatch: action draft ${rev.consId} is missing required elements: ${missing.join(', ')}`);
   }
-  for (const schema of [spec.inputSchema, spec.outputSchema]) {
-    const unsupported = findUnsupportedKeywords(schema);
-    if (unsupported.length > 0) {
+  for (const label of ['inputSchema', 'outputSchema'] as const) {
+    const schema = label === 'inputSchema' ? spec.inputSchema : spec.outputSchema;
+    const structureErrors = validateSchemaStructure(schema);
+    if (structureErrors.length > 0) {
+      const unsupported = findUnsupportedKeywords(schema);
+      const detail = unsupported.length > 0 ? `unsupported schema keywords: ${unsupported.join(', ')}` : structureErrors.join('; ');
       throw new PrimitiveError(
         'schema_mismatch',
-        `schema_mismatch: action draft ${rev.consId} uses unsupported schema keywords: ${unsupported.join(', ')}`,
+        `schema_mismatch: action draft ${rev.consId} has an invalid ${label}: ${detail}`,
       );
     }
   }
@@ -617,6 +655,40 @@ export interface ActivationMeta {
   stepId?: string | null;
 }
 
+export async function syncMethodOwnership(
+  store: ConsStoreApi,
+  actionId: string,
+  methodId: string,
+  methodRevision: number,
+  activatedBy: string,
+): Promise<ConsEdge | null> {
+  await store.setMethodBinding(actionId, methodId, methodRevision, true);
+  await store.deactivateMethodBindingsForMethod(methodId, actionId);
+  const edges = await store.listEdges(methodId, 'from', false);
+  for (const e of edges) {
+    if (e.status !== 'active') continue;
+    const stale = e.relationConsId === REL_METHOD_OF && (e.from.revision !== methodRevision || e.to.consId !== actionId);
+    if (stale) {
+      await store.archiveEdge(e.id);
+    }
+  }
+  const actionCons = await store.getCons(actionId);
+  const linked = edges.some(
+    (e) => e.status === 'active' && e.relationConsId === REL_METHOD_OF && e.from.revision === methodRevision && e.to.consId === actionId,
+  );
+  if (actionCons !== null && !linked) {
+    const edge = await store.createEdge({
+      from: { consId: methodId, revision: methodRevision },
+      relationConsId: REL_METHOD_OF,
+      to: { consId: actionId, revision: activeRevisionOf(actionCons) },
+      createdByStepId: activatedBy,
+      status: 'active',
+    });
+    return edge;
+  }
+  return null;
+}
+
 export async function activateConsInTx(
   store: ConsStoreApi,
   consId: string,
@@ -649,18 +721,7 @@ export async function activateConsInTx(
       if (actionCons === null) {
         throw new PrimitiveError('unknown_reference', `unknown_reference: method ${consId} references unknown action ${actionId}`);
       }
-      await store.setMethodBinding(actionId, consId, revision, true);
-      const edges = await store.listEdges(consId, 'from', true);
-      const linked = edges.some((e) => e.relationConsId === REL_METHOD_OF && e.to.consId === actionId);
-      if (!linked) {
-        await store.createEdge({
-          from: { consId, revision },
-          relationConsId: REL_METHOD_OF,
-          to: { consId: actionId, revision: activeRevisionOf(actionCons) },
-          createdByStepId: meta.activatedBy,
-          status: 'active',
-        });
-      }
+      await syncMethodOwnership(store, actionId, consId, revision, meta.activatedBy);
     }
   }
   const cons = await store.getCons(consId);
@@ -692,8 +753,6 @@ async function resolveMainActionId(ctx: StepContext): Promise<string | null> {
 
 async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
-  const saved = await ctx.store.getIdempotencyResult(connectResultKey(stepId));
-  if (saved !== null) return saved;
   const formedRaw = Array.isArray(input['formed']) ? input['formed'] : [];
   const tempMap = new Map<string, ConsRef>();
   const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
@@ -706,6 +765,8 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
   }
   const activate = input['activate'] !== false;
   const output = await ctx.store.transaction(async (): Promise<unknown> => {
+    const saved = await ctx.store.getIdempotencyResult(connectResultKey(stepId));
+    if (saved !== null) return saved;
     const edgeIds: string[] = [];
     const createdEdgeRefs: Array<{ id: string; from: ConsRef; relationConsId: string; to: ConsRef }> = [];
     for (const f of formed) {
@@ -770,24 +831,14 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
           `unauthorized_effect: method ${methodRef.consId} declares actionId ${String(mrev.spec['actionId'])} but is bound to ${actionId}`,
         );
       }
-      await ctx.store.setMethodBinding(actionId, methodRef.consId, methodRef.revision, true);
+      const createdMethodEdge = await syncMethodOwnership(ctx.store, actionId, methodRef.consId, methodRef.revision, stepId);
       const methodCons = await ctx.store.getCons(methodRef.consId);
       if (methodCons !== null && methodCons.status === 'active' && activeRevisionOf(methodCons) !== methodRef.revision) {
         await ctx.store.activateRevision(methodRef.consId, methodRef.revision);
       }
-      const existing = await ctx.store.listEdges(methodRef.consId, 'from', true);
-      const actionCons = await ctx.store.getCons(actionId);
-      const alreadyLinked = existing.some((x) => x.relationConsId === REL_METHOD_OF && x.to.consId === actionId);
-      if (actionCons !== null && !alreadyLinked) {
-        const edge = await ctx.store.createEdge({
-          from: methodRef,
-          relationConsId: REL_METHOD_OF,
-          to: { consId: actionId, revision: actionCons.currentRevision },
-          createdByStepId: stepId,
-          status: 'active',
-        });
-        edgeIds.push(edge.id);
-        createdEdgeRefs.push({ id: edge.id, from: methodRef, relationConsId: REL_METHOD_OF, to: { consId: actionId, revision: actionCons.currentRevision } });
+      if (createdMethodEdge !== null) {
+        edgeIds.push(createdMethodEdge.id);
+        createdEdgeRefs.push({ id: createdMethodEdge.id, from: createdMethodEdge.from, relationConsId: REL_METHOD_OF, to: createdMethodEdge.to });
       }
     }
     if (activate) {

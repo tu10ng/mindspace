@@ -21,47 +21,58 @@ function revisionInput(s: SeedCons): RevisionInput {
   return r;
 }
 
-function sameContent(a: ConsRevision, b: RevisionInput): boolean {
-  return (
-    a.title === b.title &&
-    JSON.stringify(a.roles) === JSON.stringify(b.roles) &&
-    a.body === b.body &&
-    JSON.stringify(a.aliases) === JSON.stringify(b.aliases) &&
-    JSON.stringify(a.searchTerms) === JSON.stringify(b.searchTerms) &&
-    (a.applicabilityText ?? null) === (b.applicabilityText ?? null) &&
-    JSON.stringify(a.spec ?? null) === JSON.stringify(b.spec ?? null)
-  );
-}
-
 export async function loadSeeds(store: ConsStoreApi): Promise<void> {
   await store.transaction(async () => {
     const revisions = new Map<string, number>();
     let changed = false;
 
     for (const seed of ALL_SEEDS) {
-      const input = revisionInput(seed);
       const existing = await store.getCons(seed.id);
-      let revision: number;
-      if (existing === null) {
-        await store.createCons(input, { stableId: seed.id });
-        revision = 1;
-        changed = true;
-      } else {
-        const current = await store.getRevision(seed.id);
-        if (current !== null && sameContent(current, input)) {
-          revisions.set(seed.id, current.revision);
-          continue;
+
+      if (existing !== null) {
+        const activeRevision = existing.activeRevision !== undefined && existing.activeRevision > 0
+          ? existing.activeRevision
+          : existing.currentRevision;
+        revisions.set(seed.id, activeRevision);
+        if (seed.binding !== undefined && (await store.getActiveExecutionBinding(seed.id)) === null) {
+          const binding: Parameters<ConsStoreApi['upsertExecutionBinding']>[0] = {
+            consId: seed.id,
+            revision: activeRevision,
+            executor: seed.binding.executor,
+            active: true,
+            activatedByStepId: SEED_IMPORT_STEP,
+          };
+          if (seed.binding.primitiveKey !== undefined) binding.primitiveKey = seed.binding.primitiveKey;
+          await store.upsertExecutionBinding(binding);
         }
-        const created = await store.createRevision(seed.id, input);
-        revision = created.revision;
-        await store.activateRevision(seed.id, revision);
-        changed = true;
+        if (seed.methodOf !== undefined) {
+          const bindings = await store.listActiveMethodBindings(seed.methodOf);
+          if (!bindings.some((b) => b.methodId === seed.id)) {
+            await store.setMethodBinding(seed.methodOf, seed.id, activeRevision, true);
+          }
+          const edges = await store.listEdges(seed.id, 'from', true);
+          const alreadyLinked = edges.some(
+            (e) => e.relationConsId === SEED_METHOD_OF_RELATION && e.to.consId === seed.methodOf,
+          );
+          if (!alreadyLinked) {
+            await store.createEdge({
+              from: { consId: seed.id, revision: activeRevision },
+              relationConsId: SEED_METHOD_OF_RELATION,
+              to: { consId: seed.methodOf, revision: revisions.get(seed.methodOf) ?? activeRevision },
+              status: 'active',
+            });
+          }
+        }
+        continue;
       }
+
+      const input = revisionInput(seed);
+      await store.createCons(input, { stableId: seed.id });
+      const revision = 1;
+      changed = true;
       revisions.set(seed.id, revision);
 
-      if (existing === null || existing.status !== 'active') {
-        await store.setStatus(seed.id, 'active');
-      }
+      await store.setStatus(seed.id, 'active');
 
       if (seed.binding !== undefined) {
         const binding: Parameters<ConsStoreApi['upsertExecutionBinding']>[0] = {
@@ -78,18 +89,12 @@ export async function loadSeeds(store: ConsStoreApi): Promise<void> {
       if (seed.methodOf !== undefined) {
         const actionRevision = revisions.get(seed.methodOf) ?? 1;
         await store.setMethodBinding(seed.methodOf, seed.id, revision, true);
-        const edges = await store.listEdges(seed.id, 'from', true);
-        const alreadyLinked = edges.some(
-          (e) => e.relationConsId === SEED_METHOD_OF_RELATION && e.to.consId === seed.methodOf,
-        );
-        if (!alreadyLinked) {
-          await store.createEdge({
-            from: { consId: seed.id, revision },
-            relationConsId: SEED_METHOD_OF_RELATION,
-            to: { consId: seed.methodOf, revision: actionRevision },
-            status: 'active',
-          });
-        }
+        await store.createEdge({
+          from: { consId: seed.id, revision },
+          relationConsId: SEED_METHOD_OF_RELATION,
+          to: { consId: seed.methodOf, revision: actionRevision },
+          status: 'active',
+        });
       }
     }
 

@@ -1,7 +1,7 @@
 import type {
   ActionSpec, Cons, ConsEdge, ConsRef, ConsRevision, ConsRole, ConsStatus, EffectKind,
   EventRecord, ExecutionBinding, FlowNode, FlowSpec, MethodBinding, MethodSpec,
-  Run, Step, TendencySpec,
+  Run, RunAuthorization, Step, TendencySpec,
 } from '../../src/types.js';
 import type { ConsStoreApi } from '../../src/store/api.js';
 
@@ -16,6 +16,7 @@ export class FakeStore {
   steps: Map<string, Step> = new Map();
   events: EventRecord[] = [];
   edges: ConsEdge[] = [];
+  authorizations: Map<string, RunAuthorization> = new Map();
   statePatches: Array<Record<string, unknown>> = [];
   private nextEventId = 1;
 
@@ -96,6 +97,14 @@ export class FakeStore {
     });
   }
 
+  async archiveEdge(edgeId: string): Promise<void> {
+    for (const e of this.edges) {
+      if (e.id === edgeId) {
+        e.status = 'archived';
+      }
+    }
+  }
+
   async upsertExecutionBinding(b: Omit<ExecutionBinding, 'active'> & { active: boolean }): Promise<void> {
     if (b.active) {
       for (const [key, existing] of this.bindings) {
@@ -152,6 +161,14 @@ export class FakeStore {
     return this.methodBindings.filter((b) => b.actionId === actionId && b.active);
   }
 
+  async deactivateMethodBindingsForMethod(methodId: string, keepActionId?: string): Promise<void> {
+    for (const b of this.methodBindings) {
+      if (b.methodId === methodId && b.active && b.actionId !== keepActionId) {
+        b.active = false;
+      }
+    }
+  }
+
   async createRun(run: Run): Promise<void> {
     this.runs.set(run.id, run);
   }
@@ -177,12 +194,24 @@ export class FakeStore {
     return this.runs.get(runId) ?? null;
   }
 
+  async putRunAuthorization(runId: string, key: string, record: RunAuthorization): Promise<void> {
+    this.authorizations.set(`${runId}::${key}`, { ...record });
+  }
+
+  async getRunAuthorization(runId: string, key: string): Promise<RunAuthorization | null> {
+    return this.authorizations.get(`${runId}::${key}`) ?? null;
+  }
+
   async upsertStep(step: Step): Promise<void> {
     this.steps.set(step.id, JSON.parse(JSON.stringify(step)) as Step);
   }
 
   async getStep(runId: string, nodeId: string): Promise<Step | null> {
     return this.steps.get(`${runId}::${nodeId}`) ?? null;
+  }
+
+  async getStepById(stepId: string): Promise<Step | null> {
+    return this.steps.get(stepId) ?? null;
   }
 
   async listSteps(runId: string): Promise<Step[]> {

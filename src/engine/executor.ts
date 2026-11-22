@@ -7,6 +7,7 @@ import { validateSchema } from '../schema.js';
 import { resolvePath } from './path.js';
 import { evaluateTransition, validateFlow } from './flow.js';
 import { buildPrompts } from '../llm/prompt.js';
+import { isContentActionCompatible } from '../primitives/index.js';
 import type { LlmAttemptLog } from './llm_log.js';
 import { PROMPT_TEMPLATE_VERSION } from './llm_log.js';
 
@@ -15,7 +16,6 @@ export const STATE_KEY_TENDENCY_REFS = 'tendencyRefs';
 export const STATE_KEY_METHOD_SELECTION = 'methodSelection';
 export const STATE_KEY_RUN_INPUT = 'input';
 export const STATE_KEY_CURRENT_NODE = '_currentNode';
-export const STATE_KEY_AUTHORIZATIONS = '_authorizations';
 const NETWORK_RETRIES = 2;
 const REPAIRABLE_CODES: ErrorCode[] = ['invalid_json', 'schema_mismatch', 'unknown_reference'];
 const ERROR_CODE_SET: ReadonlySet<string> = new Set<string>([
@@ -80,31 +80,29 @@ function isRef(value: unknown): value is ConsRef {
 }
 
 interface AuthorizationRecord {
+  stepId: string;
   consId: string;
   revision: number;
   title: string;
   candidates: ConsRef[];
 }
 
-function authorizationRecordsOf(state: Record<string, unknown>): Record<string, unknown> {
-  const raw = state[STATE_KEY_AUTHORIZATIONS];
-  return isRecord(raw) ? raw : {};
-}
-
-function authorizationFor(state: Record<string, unknown>, key: string): AuthorizationRecord | null {
-  const raw = resolvePath(authorizationRecordsOf(state), key);
-  if (!isRecord(raw) || typeof raw['consId'] !== 'string' || typeof raw['revision'] !== 'number') {
+async function authorizationFor(store: ConsStoreApi, runId: string, key: string): Promise<AuthorizationRecord | null> {
+  const record = await store.getRunAuthorization(runId, key);
+  if (record === null) {
     return null;
   }
-  return {
-    consId: raw['consId'],
-    revision: raw['revision'],
-    title: typeof raw['title'] === 'string' ? raw['title'] : '',
-    candidates: asRefArray(raw['candidates']),
-  };
+  const step = await store.getStepById(record.stepId);
+  if (step === null || step.runId !== runId || step.status !== 'succeeded') {
+    return null;
+  }
+  if (!record.candidates.some((c) => c.consId === record.consId && c.revision === record.revision)) {
+    return null;
+  }
+  return record;
 }
 
-function buildAuthorization(output: unknown, candidates: ExecutionEnvelope['candidates']): AuthorizationRecord | null {
+function buildAuthorization(output: unknown, candidates: ExecutionEnvelope['candidates']): Omit<AuthorizationRecord, 'stepId'> | null {
   if (isRecord(output) && output['status'] === 'selected' && isRef(output['selected'])) {
     const selected = output['selected'];
     const hit = candidates.find((c) => c.ref.consId === selected.consId && c.ref.revision === selected.revision);
@@ -146,11 +144,11 @@ function declaredTopLevelFields(schema: object): Set<string> {
 
 async function declaredFieldsForNode(
   store: ConsStoreApi,
+  runId: string,
   node: { actionId?: string; actionFrom?: string },
-  state: Record<string, unknown>,
 ): Promise<Set<string> | null> {
   try {
-    const ref = await resolveAction(store, node, state);
+    const ref = await resolveAction(store, runId, node);
     const rev = await readRevision(store, ref);
     let spec: unknown = rev.spec;
     if (!isActionSpec(spec) && isFlowSpec(spec)) {
@@ -217,8 +215,8 @@ async function readRevision(store: ConsStoreApi, ref: ConsRef): Promise<ConsRevi
 
 async function resolveAction(
   store: ConsStoreApi,
+  runId: string,
   node: { actionId?: string; actionFrom?: string },
-  state: Record<string, unknown>,
 ): Promise<ConsRef> {
   let ref: ConsRef;
   if (typeof node.actionId === 'string') {
@@ -229,7 +227,7 @@ async function resolveAction(
     ref = { consId: node.actionId, revision: binding.revision };
   } else {
     const key = node.actionFrom ?? '';
-    const record = authorizationFor(state, key);
+    const record = await authorizationFor(store, runId, key);
     if (record === null) {
       throw new StepFailure('unauthorized_action', `actionFrom "${key}" does not reference a server-authorized selection`);
     }
@@ -542,7 +540,16 @@ async function executePinnedSubflow(
     if (!isFlowSpec(flowRev.spec)) {
       throw new StepFailure('config_error', `${flowRef.consId}@${String(flowRef.revision)} has no flow spec`);
     }
-    const childState = isRecord(envelope.input) ? envelope.input : { value: envelope.input };
+    const childState: Record<string, unknown> = {};
+    if (isRecord(envelope.input)) {
+      for (const [k, v] of Object.entries(envelope.input)) {
+        if (!k.startsWith('_')) {
+          childState[k] = v;
+        }
+      }
+    } else {
+      childState['value'] = envelope.input;
+    }
     child = {
       id: childRunId,
       entryFlowRef: flowRef,
@@ -607,7 +614,7 @@ async function executeStep(deps: EngineDeps, run: Run, step: Step, envelope: Exe
   throw new StepFailure('config_error', `unknown executor "${spec.executor}"`);
 }
 
-function authorizeSelection(output: unknown, authorization: AuthorizationRecord | null): unknown {
+function authorizeSelection(output: unknown, authorization: Omit<AuthorizationRecord, 'stepId'> | null): unknown {
   if (authorization !== null && isRecord(output)) {
     return {
       ...output,
@@ -663,7 +670,7 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     }
     const existing = await deps.store.getStep(run.id, nodeId);
     if (existing !== null && existing.status === 'succeeded') {
-      const declaredFields = await declaredFieldsForNode(deps.store, node, run.state);
+      const declaredFields = await declaredFieldsForNode(deps.store, run.id, node);
       const transition = evaluateTransition(node, existing.output, declaredFields ?? undefined);
       if (transition.error !== undefined) {
         return failRun(deps, run, existing, 'schema_mismatch', transition.error);
@@ -676,12 +683,24 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     }
     let actionRef: ConsRef;
     try {
-      actionRef = await resolveAction(deps.store, node, run.state);
+      actionRef = await resolveAction(deps.store, run.id, node);
     } catch (err) {
       return failRun(deps, run, null, codeOf(err), messageOf(err));
     }
-    if (node.actionFrom !== undefined && node.allowedActionIds !== undefined && !node.allowedActionIds.includes(actionRef.consId)) {
-      return failRun(deps, run, null, 'unauthorized_action', `action ${actionRef.consId} is outside the allowed action set of node "${nodeId}"`);
+    if (node.actionFrom !== undefined) {
+      if (node.allowedActionIds !== undefined && !node.allowedActionIds.includes(actionRef.consId)) {
+        return failRun(deps, run, null, 'unauthorized_action', `action ${actionRef.consId} is outside the allowed action set of node "${nodeId}"`);
+      }
+      if (node.allowedActionIds === undefined && node.contentActionsOnly === true) {
+        const chosen = await readRevision(deps.store, actionRef);
+        let chosenSpec: unknown = chosen.spec;
+        if (!isActionSpec(chosenSpec) && isFlowSpec(chosenSpec)) {
+          chosenSpec = syntheticFlowActionSpec(actionRef);
+        }
+        if (!isContentActionCompatible(chosenSpec)) {
+          return failRun(deps, run, null, 'unauthorized_action', `action ${actionRef.consId} does not satisfy the content action contract of node "${nodeId}"`);
+        }
+      }
     }
     const actionRev = await readRevision(deps.store, actionRef);
     let actionSpec = actionRev.spec;
@@ -703,7 +722,7 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       return failRun(deps, run, null, 'schema_mismatch', inputResult.errors.join('; '));
     }
     let method: { ref: ConsRef; spec: MethodSpec; body: string } | undefined;
-    const methodAuth = authorizationFor(run.state, STATE_KEY_METHOD_SELECTION);
+    const methodAuth = await authorizationFor(deps.store, run.id, STATE_KEY_METHOD_SELECTION);
     if (methodAuth !== null) {
       const methodRev = await deps.store.getRevision(methodAuth.consId, methodAuth.revision);
       if (methodRev !== null && isMethodSpec(methodRev.spec) && methodRev.spec.actionId === actionRef.consId) {
@@ -801,13 +820,7 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     const authorization = buildAuthorization(output, candidates);
     const committedOutput = authorizeSelection(output, authorization);
     const committedStep: Step = { ...committed, output: committedOutput };
-    let nextState: Record<string, unknown> = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
-    if (authorization !== null) {
-      nextState = {
-        ...nextState,
-        [STATE_KEY_AUTHORIZATIONS]: { ...authorizationRecordsOf(run.state), [node.outputKey]: authorization },
-      };
-    }
+    const nextState: Record<string, unknown> = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
     const selectionLike = isRecord(output) && (output['status'] === 'selected' || output['status'] === 'no_candidate');
     const selectionBasis = isRecord(output) && typeof output['basisSummary'] === 'string' ? output['basisSummary'] : null;
     const rawUsedTendencies = isRecord(output) && Array.isArray(output['usedTendencies'])
@@ -823,6 +836,9 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     await deps.store.transaction(async () => {
       await deps.store.upsertStep(committedStep);
       await deps.store.updateRun(run.id, { state: nextState, counters: run.counters });
+      if (authorization !== null) {
+        await deps.store.putRunAuthorization(run.id, node.outputKey, { stepId: step.id, ...authorization });
+      }
       if (selectionLike) {
         const committedRecord = isRecord(committedOutput) ? committedOutput : {};
         await deps.store.appendEvent('selection_made', {

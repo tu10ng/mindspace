@@ -70,6 +70,71 @@ export function findUnsupportedKeywords(schema: object): string[] {
   return [...found];
 }
 
+const SUPPORTED_TYPES: ReadonlySet<string> = new Set<string>([
+  'object', 'array', 'string', 'number', 'integer', 'boolean', 'null',
+]);
+
+export function validateSchemaStructure(schema: object): string[] {
+  const errors: string[] = [];
+  const walk = (node: unknown, path: string): void => {
+    if (!isPlainObject(node)) {
+      errors.push(`${path}: schema must be a plain object`);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (!SUPPORTED_KEYWORDS.has(key)) {
+        errors.push(`${path}: unsupported schema keyword "${key}"`);
+      }
+    }
+    const type = node['type'];
+    if (type !== undefined) {
+      const list = Array.isArray(type) ? type : [type];
+      if (list.length === 0 || !list.every((t) => typeof t === 'string' && SUPPORTED_TYPES.has(t))) {
+        errors.push(`${path}: type must be a supported type or a non-empty array of supported types`);
+      }
+    }
+    const props = node['properties'];
+    let propsValid = false;
+    if (props !== undefined) {
+      if (!isPlainObject(props)) {
+        errors.push(`${path}: properties must be an object`);
+      } else {
+        propsValid = true;
+        for (const [key, sub] of Object.entries(props)) {
+          walk(sub, `${path}.${key}`);
+        }
+      }
+    }
+    const required = node['required'];
+    if (required !== undefined) {
+      if (!Array.isArray(required) || required.some((k) => typeof k !== 'string')) {
+        errors.push(`${path}: required must be an array of strings`);
+      } else if (!propsValid) {
+        errors.push(`${path}: required is declared but properties is missing`);
+      } else {
+        for (const key of required) {
+          if (!(key in (props as Record<string, unknown>))) {
+            errors.push(`${path}: required key "${key}" is not declared in properties`);
+          }
+        }
+      }
+    }
+    if (node['items'] !== undefined) {
+      walk(node['items'], `${path}.items`);
+    }
+    const en = node['enum'];
+    if (en !== undefined && (!Array.isArray(en) || en.length === 0)) {
+      errors.push(`${path}: enum must be a non-empty array`);
+    }
+    const ap = node['additionalProperties'];
+    if (ap !== undefined && typeof ap !== 'boolean') {
+      errors.push(`${path}: additionalProperties must be a boolean`);
+    }
+  };
+  walk(schema, '$');
+  return errors;
+}
+
 function check(schema: Schema, value: unknown, path: string, errors: string[]): void {
   for (const key of Object.keys(schema)) {
     if (!SUPPORTED_KEYWORDS.has(key)) {
@@ -126,7 +191,11 @@ function check(schema: Schema, value: unknown, path: string, errors: string[]): 
 
 export function validateSchema(schema: object, value: unknown): { ok: true } | { ok: false; errors: string[] } {
   const errors: string[] = [];
-  check(schema as Schema, value, '$', errors);
+  try {
+    check(schema as Schema, value, '$', errors);
+  } catch {
+    return { ok: false, errors: ['schema_mismatch: malformed schema could not be applied'] };
+  }
   if (errors.length > 0) {
     return { ok: false, errors };
   }
