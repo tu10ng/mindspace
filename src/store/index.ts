@@ -10,9 +10,12 @@ import type {
   ConsStatus,
   EventRecord,
   ExecutionBinding,
+  GraphNode,
+  GraphSnapshot,
   MethodBinding,
   Run,
   RunAuthorization,
+  RunSummary,
   SearchQuery,
   SearchResponse,
   Step,
@@ -147,6 +150,7 @@ export function openStore(path: string): ConsStoreApi {
   const db = ctx.db;
   const queue: WriteQueue = createWriteQueue();
   const txStorage = new AsyncLocalStorage<{ inside: true }>();
+  const eventListeners = new Set<(event: EventRecord) => void>();
 
   function write<T>(fn: () => T): Promise<T> {
     if (txStorage.getStore() !== undefined) {
@@ -156,13 +160,26 @@ export function openStore(path: string): ConsStoreApi {
   }
 
   function insertEventSync(eventType: string, payload: unknown, runId: string | null, stepId: string | null): void {
-    db.prepare('INSERT INTO events (run_id, step_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').run(
-      runId,
-      stepId,
-      eventType,
-      JSON.stringify(payload ?? null),
-      nowIso(),
-    );
+    const createdAt = nowIso();
+    const res = db
+      .prepare('INSERT INTO events (run_id, step_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(runId, stepId, eventType, JSON.stringify(payload ?? null), createdAt);
+    if (eventListeners.size > 0) {
+      const record: EventRecord = {
+        id: Number(res.lastInsertRowid),
+        runId,
+        stepId,
+        eventType,
+        payload: payload ?? null,
+        createdAt,
+      };
+      for (const listener of eventListeners) {
+        try {
+          listener(record);
+        } catch {
+        }
+      }
+    }
   }
 
   function insertRevisionSync(rev: ConsRevision): void {
@@ -657,6 +674,78 @@ export function openStore(path: string): ConsStoreApi {
 
     async listActiveConsByRole(role, limit) {
       return write(() => listActiveConsByRoleImpl(ctx, role, limit ?? 10000));
+    },
+
+    async getGraphSnapshot(): Promise<GraphSnapshot> {
+      return write(() => {
+        const nodeRows = db
+          .prepare(
+            `SELECT c.id, c.current_revision, c.active_revision, c.status, c.created_at,
+                    r.title, r.roles_json, r.body, r.aliases_json, r.search_terms_json,
+                    r.applicability_text, r.spec_json, r.provenance_json
+             FROM cons c
+             JOIN cons_revisions r
+               ON r.cons_id = c.id AND r.revision = c.current_revision
+             ORDER BY c.created_at ASC, c.id ASC`,
+          )
+          .all() as Row[];
+        const nodes: GraphNode[] = nodeRows.map((row) => {
+          const node: GraphNode = {
+            id: row.id as string,
+            status: row.status as ConsStatus,
+            currentRevision: row.current_revision as number,
+            activeRevision: row.active_revision as number,
+            createdAt: row.created_at as string,
+            title: row.title as string,
+            roles: JSON.parse(row.roles_json as string) as ConsRole[],
+            body: row.body as string,
+            aliases: JSON.parse(row.aliases_json as string) as string[],
+            searchTerms: JSON.parse(row.search_terms_json as string) as string[],
+            provenance: JSON.parse(row.provenance_json as string),
+          };
+          if (row.applicability_text !== null && row.applicability_text !== undefined) {
+            node.applicabilityText = row.applicability_text as string;
+          }
+          if (row.spec_json !== null && row.spec_json !== undefined) {
+            node.spec = JSON.parse(row.spec_json as string);
+          }
+          return node;
+        });
+        const edgeRows = db
+          .prepare('SELECT * FROM cons_edges ORDER BY rowid ASC')
+          .all() as Row[];
+        const edges = edgeRows.map(rowToEdge);
+        return { nodes, edges };
+      });
+    },
+
+    async listRuns(limit = 50): Promise<RunSummary[]> {
+      return write(() => {
+        const rows = db
+          .prepare(
+            `SELECT id, entry_flow_ref_json, task, status, counters_json, created_at, finished_at
+             FROM runs
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?`,
+          )
+          .all(limit) as Row[];
+        return rows.map((row) => ({
+          id: row.id as string,
+          entryFlowRef: JSON.parse(row.entry_flow_ref_json as string) as ConsRef,
+          task: row.task as string,
+          status: row.status as Run['status'],
+          counters: JSON.parse(row.counters_json as string) as Run['counters'],
+          createdAt: row.created_at as string,
+          finishedAt: (row.finished_at as string | null) ?? null,
+        }));
+      });
+    },
+
+    subscribeEvents(listener) {
+      eventListeners.add(listener);
+      return () => {
+        eventListeners.delete(listener);
+      };
     },
 
     async transaction<T>(fn: () => Promise<T>): Promise<T> {

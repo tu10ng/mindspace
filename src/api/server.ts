@@ -233,6 +233,16 @@ async function route(app: App, req: IncomingMessage, res: ServerResponse): Promi
   const parts = url.pathname.split('/').filter((p) => p.length > 0);
   const method = req.method ?? 'GET';
 
+  if (method === 'GET' && parts.length === 1 && parts[0] === 'graph') {
+    sendJson(res, 200, await app.store.getGraphSnapshot());
+    return;
+  }
+  if (method === 'GET' && parts.length === 1 && parts[0] === 'runs') {
+    const limit = Number(url.searchParams.get('limit') ?? '50');
+    const runs = await app.store.listRuns(Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 200) : 50);
+    sendJson(res, 200, { runs });
+    return;
+  }
   if (method === 'POST' && parts.length === 1 && parts[0] === 'runs') {
     const body = await readBody(req);
     if (!isRecord(body)) {

@@ -1,0 +1,32 @@
+{
+  "name": "@local/dsh-mindspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mindspace sidebar panel for DeepSeek Harness: embed the Mindspace graph engine, run flow.ingest from an input bar, configure the runtime LLM, and inspect the full graph on an Excalidraw canvas.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0",
+    "dsh": ">=0.2.1-rc.1 <0.3.0"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

@@ -329,3 +329,34 @@ export interface TendencyDraft {
 export type TendencyProposal =
   | { status: 'none'; tendency?: null }
   | { status: 'proposed'; tendency: TendencyDraft };
+
+export interface GraphNode {
+  id: string;
+  status: ConsStatus;
+  currentRevision: number;
+  activeRevision: number;
+  createdAt: string;
+  title: string;
+  roles: ConsRole[];
+  body: string;
+  aliases: string[];
+  searchTerms: string[];
+  applicabilityText?: string;
+  spec?: ActionSpec | MethodSpec | TendencySpec | FlowSpec;
+  provenance: Provenance;
+}
+
+export interface GraphSnapshot {
+  nodes: GraphNode[];
+  edges: ConsEdge[];
+}
+
+export interface RunSummary {
+  id: string;
+  entryFlowRef: ConsRef;
+  task: string;
+  status: RunStatus;
+  counters: { steps: number; llmCalls: number };
+  createdAt: string;
+  finishedAt: string | null;
+}

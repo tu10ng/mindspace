@@ -1,4 +1,4 @@
-﻿node_modules/
+node_modules/
 dist/
 *.tsbuildinfo
 *.db
@@ -6,4 +6,6 @@ dist/
 *.db-wal
 *.db-shm
 .env
+dsh-plugin/lib/vendor/
+dsh-plugin/scripts/.vendor/
 

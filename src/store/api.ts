@@ -1,6 +1,7 @@
 import type {
   Cons, ConsRef, ConsRevision, ConsEdge, ExecutionBinding, MethodBinding,
   Run, RunAuthorization, Step, EventRecord, SearchQuery, SearchResponse, ConsRole, ConsStatus,
+  GraphSnapshot, RunSummary,
 } from '../types.js';
 import type { LlmAttemptRow } from '../engine/llm_log.js';
 
@@ -50,6 +51,9 @@ export interface ConsStoreApi {
   searchByRole(query: SearchQuery, roles: ConsRole[]): Promise<SearchResponse>;
   countActiveByRole(role: ConsRole): Promise<number>;
   listActiveConsByRole(role: ConsRole, limit?: number): Promise<Array<{ ref: ConsRef; title: string }>>;
+  getGraphSnapshot(): Promise<GraphSnapshot>;
+  listRuns(limit?: number): Promise<RunSummary[]>;
+  subscribeEvents(listener: (event: EventRecord) => void): () => void;
 
   transaction<T>(fn: () => Promise<T>): Promise<T>;
   close(): void;
