@@ -15,7 +15,7 @@ import type {
 import type { ConsStoreApi } from '../store/api.js';
 import type { PrimitiveFn, StepContext } from '../engine/executor.js';
 import { validateFlow } from '../engine/flow.js';
-import { findUnsupportedKeywords, validateSchemaStructure } from '../schema.js';
+import { findUnsupportedKeywords, validateSchema, validateSchemaStructure } from '../schema.js';
 
 export const REL_METHOD_OF = 'rel.method_of';
 export const REL_USED_METHOD = 'rel.used_method';
@@ -339,7 +339,8 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
     });
     return { items: r.items, defaultMethod: r.defaultMethod };
   }
-  const wantsActions = queries.some((q) => (q.roles ?? []).includes('action'));
+  const wantsActions = queries.some((q) => (q.roles ?? []).includes('action'))
+    || (extraRoles !== undefined && extraRoles.includes('action'));
   const limit = typeof input['limit'] === 'number' ? input['limit'] : undefined;
   const anchorIds = Array.isArray(input['anchorIds']) ? input['anchorIds'].filter((v): v is string => typeof v === 'string') : [];
   const anchorQueries: CoreQuery[] = anchorIds.map((id) => ({ text: id, ...(extraRoles === undefined ? {} : { roles: extraRoles }) }));
@@ -358,28 +359,21 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
   }
   let items = await searchCore(ctx.store, [...anchorQueries, ...queries], searchOpts);
   if (input['contentActionsOnly'] === true) {
+    const baseInput: Record<string, unknown> = {
+      input: input['contextInput'] !== undefined ? input['contextInput'] : (ctx.run.state['inputCons'] ?? { text: '' }),
+      task: typeof input['contextTask'] === 'string' ? input['contextTask'] : ctx.run.task,
+    };
+    const optionalInput: Record<string, unknown> | undefined = Array.isArray(input['contextCandidates'])
+      ? { candidates: input['contextCandidates'] }
+      : undefined;
     const filtered: SearchResultItem[] = [];
     for (const item of items) {
       const rev = await ctx.store.getRevision(item.ref.consId, item.ref.revision);
-      if (rev !== null && isContentActionCompatible(rev.spec)) filtered.push(item);
+      if (rev !== null && isContentActionCompatible(rev.spec, baseInput, optionalInput)) filtered.push(item);
     }
     items = filtered;
   }
   return { items };
-}
-
-function isObjectType(value: unknown): boolean {
-  if (value === undefined) return true;
-  if (typeof value === 'string') return value === 'object';
-  if (Array.isArray(value)) return value.length > 0 && value.every((t) => t === 'object');
-  return false;
-}
-
-function isStringType(value: unknown): boolean {
-  if (value === undefined) return true;
-  if (typeof value === 'string') return value === 'string';
-  if (Array.isArray(value)) return value.length > 0 && value.every((t) => t === 'string');
-  return false;
 }
 
 function isArrayType(value: unknown): boolean {
@@ -389,23 +383,34 @@ function isArrayType(value: unknown): boolean {
   return false;
 }
 
-export function isContentActionCompatible(spec: unknown): boolean {
-  if (!isRecord(spec) || spec['kind'] !== 'action' || spec['executor'] !== 'llm') return false;
-  const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
-  const inputProperties = isRecord(inputSchema['properties']) ? inputSchema['properties'] : null;
-  const inputRequired = Array.isArray(inputSchema['required']) ? inputSchema['required'] : [];
-  if (!inputRequired.every((k) => k === 'input' || k === 'task')) return false;
-  if (inputProperties !== null) {
-    const declared = Object.keys(inputProperties);
-    if (!declared.every((k) => k === 'input' || k === 'task')) return false;
-    if (inputSchema['additionalProperties'] === false && !(declared.includes('input') && declared.includes('task'))) {
-      return false;
-    }
-    for (const [key, check] of [['input', isObjectType], ['task', isStringType]] as const) {
-      const sub = inputProperties[key];
-      if (sub !== undefined && !check(isRecord(sub) ? sub['type'] : undefined)) return false;
+export function adaptInputForSchema(
+  inputSchema: unknown,
+  baseInput: Record<string, unknown>,
+  optionalInput?: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...baseInput };
+  if (optionalInput === undefined) return result;
+  const schemaObj = isRecord(inputSchema) ? inputSchema : {};
+  const properties = isRecord(schemaObj['properties']) ? schemaObj['properties'] : null;
+  const allowExtra = properties === null && schemaObj['additionalProperties'] !== false;
+  for (const [key, value] of Object.entries(optionalInput)) {
+    if (value === undefined) continue;
+    if (key in result) continue;
+    if (allowExtra || (properties !== null && key in properties)) {
+      result[key] = value;
     }
   }
+  return result;
+}
+
+export function isContentActionCompatible(
+  spec: unknown,
+  baseInput?: Record<string, unknown>,
+  optionalInput?: Record<string, unknown>,
+): boolean {
+  if (!isRecord(spec) || spec['kind'] !== 'action' || spec['executor'] !== 'llm') return false;
+  const allowedEffects = spec['allowedEffects'];
+  if (!Array.isArray(allowedEffects) || !allowedEffects.every((e) => e === 'return_artifacts')) return false;
   const outputSchema = isRecord(spec['outputSchema']) ? spec['outputSchema'] : {};
   const outRequired = Array.isArray(outputSchema['required']) ? outputSchema['required'] : [];
   if (!outRequired.includes('artifacts') || !outRequired.includes('links')) return false;
@@ -416,7 +421,10 @@ export function isContentActionCompatible(spec: unknown): boolean {
       if (sub !== undefined && !isArrayType(isRecord(sub) ? sub['type'] : undefined)) return false;
     }
   }
-  return true;
+  const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
+  const probeBase = baseInput ?? { input: {}, task: '' };
+  const candidateInput = adaptInputForSchema(inputSchema, probeBase, optionalInput);
+  return validateSchema(inputSchema, candidateInput).ok;
 }
 
 export async function assertTempIdNamespace(store: ConsStoreApi, tempId: string): Promise<void> {
@@ -433,22 +441,257 @@ export async function assertTempIdNamespace(store: ConsStoreApi, tempId: string)
 const KIND_ROLES: Record<string, ConsRole[]> = {
   object: ['object'],
   proposition: ['proposition'],
+  relation_type: ['relation_type'],
   relation: ['relation_type'],
   method: ['method'],
   tendency: ['tendency'],
   action: ['action'],
 };
 
+function mergeUniqueStrings(base: string[], extra: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of [...base, ...extra]) {
+    const trimmed = item.trim();
+    if (trimmed === '' || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : value;
+}
+
+function compileMethodDraft(
+  draft: unknown,
+  sourceCaseRef: unknown,
+): { candidates: Array<Record<string, unknown>>; pendingMethodBinding: { actionId: string; tempId: string } } {
+  if (!isRecord(draft)) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: methodDraft must be an object');
+  }
+  const title = nonEmptyString(draft['title']);
+  const actionId = nonEmptyString(draft['actionId']);
+  const instructions = nonEmptyString(draft['instructions']);
+  const applicabilityText = nonEmptyString(draft['applicabilityText']);
+  if (title === null || actionId === null || instructions === null || applicabilityText === null) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: methodDraft requires non-empty title, actionId, instructions, and applicabilityText');
+  }
+  const tempId = 'method_draft_1';
+  const sourceRefs = isRef(sourceCaseRef) ? [sourceCaseRef] : [];
+  return {
+    candidates: [
+      {
+        tempId,
+        kind: 'method',
+        content: {
+          title,
+          body: instructions,
+          aliases: asStringArray(draft['aliases']),
+          searchTerms: asStringArray(draft['searchTerms']),
+          applicabilityText,
+          sourceRefs,
+          spec: {
+            kind: 'method',
+            actionId,
+            instructions,
+            applicabilityText,
+          },
+        },
+      },
+    ],
+    pendingMethodBinding: { actionId, tempId },
+  };
+}
+
+function compileTendencyDraft(
+  draft: unknown,
+  sourceCaseRef: unknown,
+): { candidates: Array<Record<string, unknown>>; preferIds: string[]; avoidIds: string[]; tempId: string } {
+  if (!isRecord(draft)) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: tendencyDraft must be an object');
+  }
+  const title = nonEmptyString(draft['title']);
+  const scope = draft['scope'];
+  const applicabilityText = nonEmptyString(draft['applicabilityText']);
+  const preferenceText = nonEmptyString(draft['preferenceText']);
+  if (
+    title === null ||
+    (scope !== 'action_selection' && scope !== 'method_selection') ||
+    applicabilityText === null ||
+    preferenceText === null
+  ) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: tendencyDraft requires valid title, scope, applicabilityText, and preferenceText');
+  }
+  const preferIds = asStringArray(draft['preferIds']);
+  const avoidIds = asStringArray(draft['avoidIds']);
+  const tempId = 'tendency_draft_1';
+  const sourceRefs = isRef(sourceCaseRef) ? [sourceCaseRef] : [];
+  return {
+    candidates: [
+      {
+        tempId,
+        kind: 'tendency',
+        content: {
+          title,
+          body: preferenceText,
+          aliases: asStringArray(draft['aliases']),
+          searchTerms: asStringArray(draft['searchTerms']),
+          applicabilityText,
+          sourceRefs,
+          spec: {
+            kind: 'tendency',
+            scope,
+            applicabilityText,
+            preferenceText,
+            preferIds,
+            avoidIds,
+          },
+        },
+      },
+    ],
+    preferIds,
+    avoidIds,
+    tempId,
+  };
+}
+
+function compileActionDraft(
+  draft: unknown,
+): { candidates: Array<Record<string, unknown>>; methodBindings: Array<{ actionId: string; methodRef: string }> } {
+  if (!isRecord(draft)) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: actionDraft must be an object');
+  }
+  const title = nonEmptyString(draft['title']);
+  const body = nonEmptyString(draft['body']);
+  const inputSchema = draft['inputSchema'];
+  const outputSchema = draft['outputSchema'];
+  const freedom = draft['freedom'];
+  const defaultMethod = draft['defaultMethod'];
+  if (
+    title === null ||
+    body === null ||
+    !isRecord(inputSchema) ||
+    !isRecord(outputSchema) ||
+    !isRecord(freedom) ||
+    !isRecord(defaultMethod)
+  ) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: actionDraft missing required fields');
+  }
+  const methodTitle = nonEmptyString(defaultMethod['title']);
+  const methodInstructions = nonEmptyString(defaultMethod['instructions']);
+  const methodApplicability = nonEmptyString(defaultMethod['applicabilityText']);
+  if (methodTitle === null || methodInstructions === null || methodApplicability === null) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: actionDraft.defaultMethod requires non-empty title, instructions, and applicabilityText');
+  }
+  const actionTempId = 'action_draft_1';
+  const methodTempId = 'action_default_method_1';
+  return {
+    candidates: [
+      {
+        tempId: methodTempId,
+        kind: 'method',
+        content: {
+          title: methodTitle,
+          body: methodInstructions,
+          aliases: asStringArray(defaultMethod['aliases']),
+          searchTerms: asStringArray(defaultMethod['searchTerms']),
+          applicabilityText: methodApplicability,
+          spec: {
+            kind: 'method',
+            actionId: actionTempId,
+            instructions: methodInstructions,
+            applicabilityText: methodApplicability,
+          },
+        },
+      },
+      {
+        tempId: actionTempId,
+        kind: 'action',
+        content: {
+          title,
+          body,
+          aliases: asStringArray(draft['aliases']),
+          searchTerms: asStringArray(draft['searchTerms']),
+          spec: {
+            kind: 'action',
+            inputSchema,
+            outputSchema,
+            executor: 'llm',
+            defaultMethodId: methodTempId,
+            allowedEffects: ['return_artifacts'],
+            freedom,
+          },
+        },
+      },
+    ],
+    methodBindings: [{ actionId: actionTempId, methodRef: methodTempId }],
+  };
+}
+
 async function formPrimitive(ctx: StepContext): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
-  const candidates = Array.isArray(input['candidates']) ? input['candidates'] : [];
-  const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
-  await ctx.store.transaction(async () => {
+  const resultKey = `${ctx.step.id}:result`;
+  return ctx.store.transaction(async () => {
+    const savedAll = await ctx.store.getIdempotencyResult(resultKey);
+    if (savedAll !== null) return savedAll;
+
+    let candidates: unknown[] = [];
+    const compiledMethodBindings: Array<{ actionId: string; methodRef: ConsRef | string }> = [];
+    let pendingMethodBinding: { actionId: string; tempId: string } | null = null;
+    let pendingTendencyLinks: { tempId: string; preferIds: string[]; avoidIds: string[] } | null = null;
+
+    if (input['methodDraft'] !== undefined) {
+      const compiled = compileMethodDraft(input['methodDraft'], input['sourceCaseRef']);
+      candidates = compiled.candidates;
+      pendingMethodBinding = compiled.pendingMethodBinding;
+    } else if (input['tendencyDraft'] !== undefined) {
+      const compiled = compileTendencyDraft(input['tendencyDraft'], input['sourceCaseRef']);
+      candidates = compiled.candidates;
+      pendingTendencyLinks = { tempId: compiled.tempId, preferIds: compiled.preferIds, avoidIds: compiled.avoidIds };
+    } else if (input['actionDraft'] !== undefined) {
+      const compiled = compileActionDraft(input['actionDraft']);
+      candidates = compiled.candidates;
+      compiledMethodBindings.push(...compiled.methodBindings);
+    } else if (Array.isArray(input['candidates'])) {
+      candidates = input['candidates'];
+    } else {
+      throw new PrimitiveError('schema_mismatch', 'schema_mismatch: form requires candidates or a structured draft');
+    }
+
+    const metadataMap = new Map<string, { aliases: string[]; searchTerms: string[]; applicabilityText?: string }>();
+    if (Array.isArray(input['metadata'])) {
+      for (const m of input['metadata']) {
+        if (!isRecord(m) || typeof m['tempId'] !== 'string' || m['tempId'].trim() === '') continue;
+        const entry: { aliases: string[]; searchTerms: string[]; applicabilityText?: string } = {
+          aliases: asStringArray(m['aliases']),
+          searchTerms: asStringArray(m['searchTerms']),
+        };
+        if (typeof m['applicabilityText'] === 'string' && m['applicabilityText'].trim() !== '') {
+          entry.applicabilityText = m['applicabilityText'];
+        }
+        metadataMap.set(m['tempId'], entry);
+      }
+    }
+
+    const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
+    const formedByTempId = new Map<string, ConsRef>();
+    const seenTempIds = new Set<string>();
     let opIndex = 0;
+
     for (const c of candidates) {
       if (!isRecord(c)) continue;
       const tempId = asString(c['tempId'], '');
-      await assertTempIdNamespace(ctx.store, tempId);
+      if (tempId !== '') {
+        if (seenTempIds.has(tempId)) {
+          throw new PrimitiveError('schema_mismatch', `schema_mismatch: duplicate tempId "${tempId}" in form candidates`);
+        }
+        seenTempIds.add(tempId);
+        await assertTempIdNamespace(ctx.store, tempId);
+      }
       const kind = asString(c['kind'], 'object');
       const content = isRecord(c['content']) ? c['content'] : {};
       const key = `${ctx.step.id}:${String(opIndex)}`;
@@ -456,17 +699,28 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
       const saved = await ctx.store.getIdempotencyResult(key);
       if (saved !== null && isRecord(saved) && isRef(saved['consRef'])) {
         formed.push({ tempId, consRef: saved['consRef'] });
+        if (tempId !== '') formedByTempId.set(tempId, saved['consRef']);
         continue;
       }
+      const title = nonEmptyString(content['title']);
+      if (title === null) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: candidate "${tempId}" is missing a non-empty content.title`);
+      }
+      const rawBody = nonEmptyString(content['body']) ?? (kind === 'method' ? nonEmptyString(content['instructions']) : null);
+      if (rawBody === null) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: candidate "${tempId}" is missing a non-empty content.body`);
+      }
+      const meta = tempId !== '' ? metadataMap.get(tempId) : undefined;
+      const aliases = mergeUniqueStrings(asStringArray(content['aliases']), meta?.aliases ?? []);
+      const searchTerms = mergeUniqueStrings(asStringArray(content['searchTerms']), meta?.searchTerms ?? []);
       const id = randomUUID();
-      const title = asString(content['title'], tempId || id);
       const revInput: Omit<ConsRevision, 'revision' | 'createdAt'> = {
         consId: id,
         title,
         roles: KIND_ROLES[kind] ?? ['object'],
-        body: asString(content['body'], asString(content['instructions'], title)),
-        aliases: asStringArray(content['aliases']),
-        searchTerms: asStringArray(content['searchTerms']),
+        body: rawBody,
+        aliases,
+        searchTerms,
         provenance: {
           source: 'llm',
           runId: ctx.run.id,
@@ -474,8 +728,10 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
           sourceRefs: asRefs(content['sourceRefs']),
         },
       };
-      if (typeof content['applicabilityText'] === 'string') {
+      if (typeof content['applicabilityText'] === 'string' && content['applicabilityText'].trim() !== '') {
         revInput.applicabilityText = content['applicabilityText'];
+      } else if (meta?.applicabilityText !== undefined) {
+        revInput.applicabilityText = meta.applicabilityText;
       }
       if (content['spec'] !== undefined && isRecord(content['spec'])) {
         revInput.spec = content['spec'] as unknown as NonNullable<ConsRevision['spec']>;
@@ -484,9 +740,45 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
       const consRef = { consId: id, revision: 1 };
       await ctx.store.putIdempotencyResult(key, { consRef });
       formed.push({ tempId, consRef });
+      if (tempId !== '') formedByTempId.set(tempId, consRef);
     }
+
+    if (pendingMethodBinding !== null) {
+      const ref = formedByTempId.get(pendingMethodBinding.tempId);
+      if (ref !== undefined) {
+        compiledMethodBindings.push({ actionId: pendingMethodBinding.actionId, methodRef: ref });
+      }
+    }
+
+    const compiledEdges: Array<{ from: ConsRef; relationConsId: string; to: ConsRef }> = [];
+    if (pendingTendencyLinks !== null) {
+      const fromRef = formedByTempId.get(pendingTendencyLinks.tempId);
+      if (fromRef !== undefined) {
+        for (const targetId of pendingTendencyLinks.preferIds) {
+          const toRef = await activeRef(ctx.store, targetId);
+          if (toRef !== null) {
+            compiledEdges.push({ from: fromRef, relationConsId: REL_PREFERS, to: toRef });
+          }
+        }
+        for (const targetId of pendingTendencyLinks.avoidIds) {
+          const toRef = await activeRef(ctx.store, targetId);
+          if (toRef !== null) {
+            compiledEdges.push({ from: fromRef, relationConsId: REL_AVOIDS, to: toRef });
+          }
+        }
+      }
+    }
+
+    const out: Record<string, unknown> = { formed };
+    if (compiledMethodBindings.length > 0) {
+      out['methodBindings'] = compiledMethodBindings;
+    }
+    if (compiledEdges.length > 0) {
+      out['edges'] = compiledEdges;
+    }
+    await ctx.store.putIdempotencyResult(resultKey, out);
+    return out;
   });
-  return { formed };
 }
 
 async function resolveEndpoint(
@@ -764,49 +1056,130 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
     }
   }
   const activate = input['activate'] !== false;
+  const allowRelationTypeActivation = input['allowRelationTypeActivation'] === true;
   const output = await ctx.store.transaction(async (): Promise<unknown> => {
     const saved = await ctx.store.getIdempotencyResult(connectResultKey(stepId));
     if (saved !== null) return saved;
     const edgeIds: string[] = [];
     const createdEdgeRefs: Array<{ id: string; from: ConsRef; relationConsId: string; to: ConsRef }> = [];
+    const formedRevisions = new Map<string, ConsRevision>();
+    const relationTypeDrafts: Array<{ tempId: string; consRef: ConsRef }> = [];
     for (const f of formed) {
       const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
       if (rev === null) {
         throw new PrimitiveError('unknown_reference', `draft revision ${f.consRef.consId}@${String(f.consRef.revision)} not found`);
       }
+      formedRevisions.set(f.consRef.consId, rev);
+      if (rev.roles.includes('relation_type')) {
+        relationTypeDrafts.push(f);
+      }
     }
+    if (activate && relationTypeDrafts.length > 0 && !allowRelationTypeActivation) {
+      throw new PrimitiveError(
+        'unauthorized_effect',
+        'unauthorized_effect: activating new relation_type drafts requires explicit flow authorization',
+      );
+    }
+
     const edges = Array.isArray(input['edges']) ? input['edges'] : [];
+    const plannedEdges: Array<{ from: ConsRef; to: ConsRef; relationConsId: string }> = [];
     for (const e of edges) {
-      if (!isRecord(e)) continue;
-      const from = await resolveEndpoint(ctx.store, e['from'], tempMap);
-      const to = await resolveEndpoint(ctx.store, e['to'], tempMap);
-      const rel = e['relationConsId'];
-      if (from === null || to === null || typeof rel !== 'string') {
-        throw new PrimitiveError('unknown_reference', 'edge endpoint or relation type unresolved');
+      if (!isRecord(e)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: edge item must be an object');
+      }
+      let from: ConsRef | null = null;
+      if (typeof e['fromTempId'] === 'string') {
+        from = tempMap.get(e['fromTempId']) ?? null;
+      } else if (e['from'] !== undefined) {
+        from = await resolveEndpoint(ctx.store, e['from'], tempMap);
+      }
+      let to: ConsRef | null = null;
+      if (typeof e['toTempId'] === 'string') {
+        to = tempMap.get(e['toTempId']) ?? null;
+      } else if (e['to'] !== undefined) {
+        to = await resolveEndpoint(ctx.store, e['to'], tempMap);
+      }
+      if (from === null || to === null) {
+        throw new PrimitiveError('unknown_reference', 'edge endpoint unresolved');
       }
       await assertEndpointRevision(ctx.store, from, 'edge endpoint');
       await assertEndpointRevision(ctx.store, to, 'edge endpoint');
-      const relCons = await ctx.store.getCons(rel);
-      if (relCons === null) {
-        throw new PrimitiveError('unknown_reference', `relation cons ${rel} not found`);
+
+      let relationConsId: string;
+      const relSpec = e['relation'];
+      if (isRecord(relSpec)) {
+        const kind = relSpec['kind'];
+        if (kind === 'existing') {
+          if (relSpec['tempId'] !== undefined || !isRef(relSpec['ref'])) {
+            throw new PrimitiveError('schema_mismatch', 'schema_mismatch: existing relation requires ref without tempId');
+          }
+          const relRef = relSpec['ref'];
+          const relCons = await ctx.store.getCons(relRef.consId);
+          if (relCons === null) {
+            throw new PrimitiveError('unknown_reference', `relation cons ${relRef.consId} not found`);
+          }
+          const relRev = await ctx.store.getRevision(relRef.consId, relRef.revision);
+          if (relRev === null) {
+            throw new PrimitiveError('unknown_reference', `relation revision ${relRef.consId}@${String(relRef.revision)} not found`);
+          }
+          if (
+            relCons.status !== 'active' ||
+            activeRevisionOf(relCons) !== relRef.revision ||
+            !relRev.roles.includes('relation_type')
+          ) {
+            throw new PrimitiveError(
+              'unauthorized_effect',
+              `unauthorized_effect: relation ${relRef.consId}@${String(relRef.revision)} is not an active relation_type`,
+            );
+          }
+          relationConsId = relRef.consId;
+        } else if (kind === 'draft') {
+          if (relSpec['ref'] !== undefined || typeof relSpec['tempId'] !== 'string' || relSpec['tempId'].trim() === '') {
+            throw new PrimitiveError('schema_mismatch', 'schema_mismatch: draft relation requires non-empty tempId without ref');
+          }
+          if (!activate || !allowRelationTypeActivation) {
+            throw new PrimitiveError(
+              'unauthorized_effect',
+              'unauthorized_effect: referencing a draft relation_type requires explicit flow authorization',
+            );
+          }
+          const relTempId = relSpec['tempId'];
+          const draftRef = tempMap.get(relTempId);
+          if (draftRef === undefined) {
+            throw new PrimitiveError('unknown_reference', `draft relation tempId "${relTempId}" not found in batch`);
+          }
+          const draftRev = formedRevisions.get(draftRef.consId);
+          if (draftRev === undefined || !draftRev.roles.includes('relation_type')) {
+            throw new PrimitiveError(
+              'unauthorized_effect',
+              `unauthorized_effect: draft tempId "${relTempId}" is not a relation_type`,
+            );
+          }
+          relationConsId = draftRef.consId;
+        } else {
+          throw new PrimitiveError('schema_mismatch', `schema_mismatch: unsupported relation kind "${String(kind)}"`);
+        }
+      } else if (typeof e['relationConsId'] === 'string') {
+        const rel = e['relationConsId'];
+        const relCons = await ctx.store.getCons(rel);
+        if (relCons === null) {
+          throw new PrimitiveError('unknown_reference', `relation cons ${rel} not found`);
+        }
+        const relRev = await ctx.store.getRevision(relCons.id, activeRevisionOf(relCons));
+        if (relCons.status !== 'active' || relRev === null || !relRev.roles.includes('relation_type')) {
+          throw new PrimitiveError('unauthorized_effect', `unauthorized_effect: relation cons ${rel} is not an active relation_type`);
+        }
+        relationConsId = rel;
+      } else {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: edge requires relation or relationConsId');
       }
-      const relRev = await ctx.store.getRevision(relCons.id, activeRevisionOf(relCons));
-      if (relCons.status !== 'active' || relRev === null || !relRev.roles.includes('relation_type')) {
-        throw new PrimitiveError('unauthorized_effect', `unauthorized_effect: relation cons ${rel} is not an active relation_type`);
-      }
-      const edge = await ctx.store.createEdge({
-        from,
-        relationConsId: rel,
-        to,
-        createdByStepId: stepId,
-        status: 'active',
-      });
-      edgeIds.push(edge.id);
-      createdEdgeRefs.push({ id: edge.id, from, relationConsId: rel, to });
+      plannedEdges.push({ from, to, relationConsId });
     }
+
     const formedIds = new Set(formed.map((f) => f.consRef.consId));
     const mainActionId = await resolveMainActionId(ctx);
     const bindings = Array.isArray(input['methodBindings']) ? input['methodBindings'] : [];
+    const plannedBindings: Array<{ actionId: string; methodRef: ConsRef }> = [];
     for (const b of bindings) {
       if (!isRecord(b) || typeof b['actionId'] !== 'string' || !isRef(b['methodRef'])) continue;
       const actionId = b['actionId'];
@@ -831,20 +1204,55 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
           `unauthorized_effect: method ${methodRef.consId} declares actionId ${String(mrev.spec['actionId'])} but is bound to ${actionId}`,
         );
       }
-      const createdMethodEdge = await syncMethodOwnership(ctx.store, actionId, methodRef.consId, methodRef.revision, stepId);
-      const methodCons = await ctx.store.getCons(methodRef.consId);
-      if (methodCons !== null && methodCons.status === 'active' && activeRevisionOf(methodCons) !== methodRef.revision) {
-        await ctx.store.activateRevision(methodRef.consId, methodRef.revision);
+      plannedBindings.push({ actionId, methodRef });
+    }
+
+    if (activate && allowRelationTypeActivation) {
+      for (const f of relationTypeDrafts) {
+        await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
+          activatedBy: stepId,
+          runId: ctx.run.id,
+          stepId,
+        });
+      }
+    }
+
+    for (const pe of plannedEdges) {
+      const relCons = await ctx.store.getCons(pe.relationConsId);
+      const relRev = relCons !== null ? await ctx.store.getRevision(relCons.id, activeRevisionOf(relCons)) : null;
+      if (relCons === null || relCons.status !== 'active' || relRev === null || !relRev.roles.includes('relation_type')) {
+        throw new PrimitiveError(
+          'unauthorized_effect',
+          `unauthorized_effect: relation cons ${pe.relationConsId} is not an active relation_type`,
+        );
+      }
+      const edge = await ctx.store.createEdge({
+        from: pe.from,
+        relationConsId: pe.relationConsId,
+        to: pe.to,
+        createdByStepId: stepId,
+        status: 'active',
+      });
+      edgeIds.push(edge.id);
+      createdEdgeRefs.push({ id: edge.id, from: pe.from, relationConsId: pe.relationConsId, to: pe.to });
+    }
+
+    for (const pb of plannedBindings) {
+      const createdMethodEdge = await syncMethodOwnership(ctx.store, pb.actionId, pb.methodRef.consId, pb.methodRef.revision, stepId);
+      const methodCons = await ctx.store.getCons(pb.methodRef.consId);
+      if (methodCons !== null && methodCons.status === 'active' && activeRevisionOf(methodCons) !== pb.methodRef.revision) {
+        await ctx.store.activateRevision(pb.methodRef.consId, pb.methodRef.revision);
       }
       if (createdMethodEdge !== null) {
         edgeIds.push(createdMethodEdge.id);
         createdEdgeRefs.push({ id: createdMethodEdge.id, from: createdMethodEdge.from, relationConsId: REL_METHOD_OF, to: createdMethodEdge.to });
       }
     }
+
     if (activate) {
       for (const f of formed) {
-        const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
-        if (rev === null || rev.roles.includes('action')) continue;
+        const rev = formedRevisions.get(f.consRef.consId);
+        if (rev === undefined || rev.roles.includes('action') || rev.roles.includes('relation_type')) continue;
         await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
           activatedBy: stepId,
           runId: ctx.run.id,
@@ -852,8 +1260,8 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
         });
       }
       for (const f of formed) {
-        const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
-        if (rev === null || !rev.roles.includes('action')) continue;
+        const rev = formedRevisions.get(f.consRef.consId);
+        if (rev === undefined || !rev.roles.includes('action')) continue;
         await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
           activatedBy: stepId,
           runId: ctx.run.id,

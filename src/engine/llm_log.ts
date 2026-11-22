@@ -19,4 +19,4 @@ export interface LlmAttemptLog {
   getLastSuccess(stepId: string): Promise<LlmAttemptRow | null>;
 }
 
-export const PROMPT_TEMPLATE_VERSION = 'v1';
+export const PROMPT_TEMPLATE_VERSION = 'v2';

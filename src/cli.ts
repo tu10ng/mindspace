@@ -204,8 +204,8 @@ async function resolveLlm(mock: boolean): Promise<import('./types.js').LlmAdapte
       const fallback = input['defaultMethod'] as { consId: string; revision: number } | undefined;
       return { status: 'selected', selected: fallback ?? null, usedTendencies: [], basisSummary: 'mock', usedDefaultFreedom: true };
     }
-    if (action === 'seed.decompose') return { artifacts: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象' } }], links: [], executionSummary: 'mock 拆解' };
-    if (action === 'seed.prepare_connections') return { candidates: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象' } }], edges: [] };
+    if (action === 'seed.decompose') return { artifacts: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象', body: '输入中的核心对象。' } }], links: [], executionSummary: 'mock 拆解' };
+    if (action === 'seed.prepare_connections') return { metadata: [{ tempId: 'a1', aliases: [], searchTerms: ['中心对象'] }] };
     if (action === 'seed.extract_method') return { status: 'none' };
     if (action === 'seed.extract_tendency') return { status: 'none' };
     if (action === 'seed.define_action') return { status: 'none' };

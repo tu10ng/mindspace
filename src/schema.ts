@@ -13,6 +13,13 @@ export interface SchemaResult {
   errors: string[];
 }
 
+export interface SchemaErrorDetail {
+  path: string;
+  value?: unknown;
+  allowedValues?: unknown[];
+  message: string;
+}
+
 const SUPPORTED_KEYWORDS: ReadonlySet<string> = new Set<string>([
   'type',
   'properties',
@@ -135,22 +142,31 @@ export function validateSchemaStructure(schema: object): string[] {
   return errors;
 }
 
-function check(schema: Schema, value: unknown, path: string, errors: string[]): void {
+function check(schema: Schema, value: unknown, path: string, errors: SchemaErrorDetail[]): void {
   for (const key of Object.keys(schema)) {
     if (!SUPPORTED_KEYWORDS.has(key)) {
-      errors.push(`${path}: unsupported schema keyword "${key}"`);
+      errors.push({ path, message: `unsupported schema keyword "${key}"` });
     }
   }
   if (schema.type !== undefined) {
     const expected = Array.isArray(schema.type) ? schema.type : [schema.type];
     if (!expected.some((t) => typeMatches(t, value))) {
-      errors.push(`${path}: expected type ${expected.join('|')}, got ${Array.isArray(value) ? 'array' : typeof value}`);
+      errors.push({
+        path,
+        value,
+        message: `expected type ${expected.join('|')}, got ${Array.isArray(value) ? 'array' : typeof value}`,
+      });
       return;
     }
   }
   if (schema.enum !== undefined) {
     if (!schema.enum.some((v) => v === value)) {
-      errors.push(`${path}: value ${JSON.stringify(value)} not in enum`);
+      errors.push({
+        path,
+        value,
+        allowedValues: [...schema.enum],
+        message: `value ${JSON.stringify(value)} not in enum`,
+      });
       return;
     }
   }
@@ -159,7 +175,10 @@ function check(schema: Schema, value: unknown, path: string, errors: string[]): 
     if (schema.required !== undefined) {
       for (const key of schema.required) {
         if (!(key in obj)) {
-          errors.push(`${path}: missing required property "${key}"`);
+          errors.push({
+            path: `${path}.${key}`,
+            message: `missing required property "${key}"`,
+          });
         }
       }
     }
@@ -174,7 +193,12 @@ function check(schema: Schema, value: unknown, path: string, errors: string[]): 
       const declared = schema.properties === undefined ? new Set<string>() : new Set(Object.keys(schema.properties));
       for (const key of Object.keys(obj)) {
         if (!declared.has(key)) {
-          errors.push(`${path}: additional property "${key}" not allowed`);
+          errors.push({
+            path: `${path}.${key}`,
+            value: obj[key],
+            allowedValues: [...declared],
+            message: `additional property "${key}" not allowed`,
+          });
         }
       }
     }
@@ -189,15 +213,26 @@ function check(schema: Schema, value: unknown, path: string, errors: string[]): 
   }
 }
 
-export function validateSchema(schema: object, value: unknown): { ok: true } | { ok: false; errors: string[] } {
-  const errors: string[] = [];
+export function validateSchemaDetailed(
+  schema: object,
+  value: unknown,
+): { ok: true } | { ok: false; errors: SchemaErrorDetail[] } {
+  const errors: SchemaErrorDetail[] = [];
   try {
     check(schema as Schema, value, '$', errors);
   } catch {
-    return { ok: false, errors: ['schema_mismatch: malformed schema could not be applied'] };
+    return { ok: false, errors: [{ path: '$', message: 'schema_mismatch: malformed schema could not be applied' }] };
   }
   if (errors.length > 0) {
     return { ok: false, errors };
   }
   return { ok: true };
+}
+
+export function validateSchema(schema: object, value: unknown): { ok: true } | { ok: false; errors: string[] } {
+  const res = validateSchemaDetailed(schema, value);
+  if (res.ok) {
+    return { ok: true };
+  }
+  return { ok: false, errors: res.errors.map((e) => `${e.path}: ${e.message}`) };
 }

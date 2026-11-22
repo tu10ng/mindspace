@@ -30,6 +30,15 @@ export function validateFlow(spec: FlowSpec): string[] {
     if (node.inputBindings === null || typeof node.inputBindings !== 'object' || Array.isArray(node.inputBindings)) {
       errors.push(`node "${id}": inputBindings must be a record`);
     }
+    if (
+      node.optionalInputBindings !== undefined &&
+      (node.optionalInputBindings === null || typeof node.optionalInputBindings !== 'object' || Array.isArray(node.optionalInputBindings))
+    ) {
+      errors.push(`node "${id}": optionalInputBindings must be a record`);
+    }
+    if (node.allowRelationTypeProposals !== undefined && typeof node.allowRelationTypeProposals !== 'boolean') {
+      errors.push(`node "${id}": allowRelationTypeProposals must be a boolean`);
+    }
     if (typeof node.outputKey !== 'string' || node.outputKey.length === 0) {
       errors.push(`node "${id}": outputKey must be a non-empty string`);
     } else if (node.outputKey.startsWith('_')) {

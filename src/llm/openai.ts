@@ -32,11 +32,21 @@ export function createOpenAiCompatibleLlm(opts: OpenAiCompatibleOptions): LlmAda
         throw new Error(`llm http ${String(res.status)}: ${body}`);
       }
       const data: unknown = await res.json();
-      const choices = (data as { choices?: Array<{ message?: { content?: unknown } }> }).choices;
+      const choices = (data as {
+        choices?: Array<{
+          message?: { content?: unknown };
+          finish_reason?: unknown;
+        }>;
+        stop_reason?: unknown;
+      }).choices;
       const content = choices?.[0]?.message?.content;
       if (typeof content !== 'string') {
         throw new Error('llm response missing message content');
       }
+      const rawFinishReason = choices?.[0]?.finish_reason ?? (data as { stop_reason?: unknown }).stop_reason;
+      const stopReason = typeof rawFinishReason === 'string'
+        ? (rawFinishReason === 'length' ? 'max_tokens' : rawFinishReason)
+        : undefined;
       const usageRaw = (data as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage;
       const usage = usageRaw === undefined
         ? undefined
@@ -49,6 +59,9 @@ export function createOpenAiCompatibleLlm(opts: OpenAiCompatibleOptions): LlmAda
         latencyMs: Date.now() - started,
         model: opts.model,
       };
+      if (stopReason !== undefined) {
+        response.stopReason = stopReason;
+      }
       if (usage !== undefined) {
         response.usage = usage;
       }

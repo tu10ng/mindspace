@@ -61,7 +61,9 @@ export interface FlowNode {
   actionFrom?: string;
   allowedActionIds?: string[];
   contentActionsOnly?: boolean;
+  allowRelationTypeProposals?: boolean;
   inputBindings: Record<string, Binding>;
+  optionalInputBindings?: Record<string, Binding>;
   outputKey: string;
   next?: string;
   transitions?: {
@@ -182,24 +184,60 @@ export interface Step {
   llmAttemptCount: number;
 }
 
+export interface ArtifactContent {
+  title: string;
+  body: string;
+  aliases?: string[];
+  searchTerms?: string[];
+  applicabilityText?: string;
+  spec?: ActionSpec | MethodSpec | TendencySpec | FlowSpec;
+  sourceRefs?: ConsRef[];
+}
+
 export interface Artifact {
   tempId: string;
-  kind: 'object' | 'proposition' | 'relation' | 'method' | 'tendency' | 'action';
-  content: unknown;
+  kind: 'object' | 'proposition' | 'relation_type' | 'relation' | 'method' | 'tendency' | 'action';
+  content: ArtifactContent | unknown;
+}
+
+export type RelationTarget =
+  | { kind: 'existing'; ref: ConsRef }
+  | { kind: 'draft'; tempId: string };
+
+export interface ArtifactLink {
+  fromTempId: string;
+  relation: RelationTarget;
+  toTempId: string;
+}
+
+export interface AvailableRefItem {
+  consId: string;
+  revision: number;
+  title: string;
+  description: string;
+}
+
+export interface AvailableReferences {
+  availableActions?: AvailableRefItem[];
+  availableMethods?: AvailableRefItem[];
+  availableTendencies?: AvailableRefItem[];
+  availableRelationTypes?: AvailableRefItem[];
 }
 
 export interface ExecutionEnvelope {
   runId: string;
   stepId: string;
   task: string;
-  action: { ref: ConsRef; spec: ActionSpec; body: string };
+  action: { ref: ConsRef; title?: string; spec: ActionSpec; body: string };
   method?: { ref: ConsRef; spec: MethodSpec; body: string };
-  tendencies: Array<{ ref: ConsRef; spec: TendencySpec }>;
+  tendencies: Array<{ ref: ConsRef; title?: string; spec: TendencySpec }>;
   input: unknown;
   candidates: Array<{ ref: ConsRef; title: string; roles: ConsRole[]; summary: string }>;
   allowedEffects: EffectKind[];
   outputSchema: object;
   allowedRelationTypes?: string[];
+  availableReferences?: AvailableReferences;
+  allowRelationTypeDrafts?: boolean;
 }
 
 export interface SearchResultItem {
@@ -222,10 +260,19 @@ export interface SearchResponse {
 }
 
 export type ErrorCode =
-  | 'invalid_json' | 'schema_mismatch' | 'unknown_reference'
+  | 'invalid_json' | 'truncated_output' | 'schema_mismatch'
+  | 'invalid_reference' | 'unknown_reference'
   | 'unauthorized_action' | 'unauthorized_effect' | 'missing_binding'
   | 'revision_conflict' | 'model_unavailable' | 'no_candidate'
   | 'budget_exhausted' | 'config_error';
+
+export interface ValidationIssue {
+  code: ErrorCode;
+  path: string;
+  value?: unknown;
+  allowedValues?: unknown[];
+  message: string;
+}
 
 export interface LlmRequest {
   systemPrompt: string;
@@ -236,6 +283,7 @@ export interface LlmRequest {
 
 export interface LlmResponse {
   text: string;
+  stopReason?: string;
   usage?: { inputTokens: number; outputTokens: number };
   latencyMs: number;
   model: string;
@@ -254,27 +302,30 @@ export interface EventRecord {
   createdAt: string;
 }
 
-export type MethodProposal =
-  | { status: 'none'; }
-  | {
-  status: 'proposed';
+export interface MethodDraft {
   title: string;
   actionId: string;
-  applicabilityText: string;
   instructions: string;
-  aliases: string[];
-  searchTerms: string[];
-  sourceCaseId: string;
+  applicabilityText: string;
+  aliases?: string[];
+  searchTerms?: string[];
 }
 
-export type TendencyProposal =
-  | { status: 'none'; }
-  | {
-  status: 'proposed';
+export type MethodProposal =
+  | { status: 'none'; method?: null }
+  | { status: 'proposed'; method: MethodDraft };
+
+export interface TendencyDraft {
   title: string;
   scope: 'action_selection' | 'method_selection';
   applicabilityText: string;
   preferenceText: string;
-  preferIds: string[];
-  avoidIds: string[];
+  preferIds?: string[];
+  avoidIds?: string[];
+  aliases?: string[];
+  searchTerms?: string[];
 }
+
+export type TendencyProposal =
+  | { status: 'none'; tendency?: null }
+  | { status: 'proposed'; tendency: TendencyDraft };
