@@ -59,6 +59,7 @@ export interface FlowSpec {
 export interface FlowNode {
   actionId?: string;
   actionFrom?: string;
+  allowedActionIds?: string[];
   inputBindings: Record<string, Binding>;
   outputKey: string;
   next?: string;

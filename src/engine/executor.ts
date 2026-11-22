@@ -553,9 +553,17 @@ async function executeStep(deps: EngineDeps, run: Run, step: Step, envelope: Exe
   throw new StepFailure('config_error', `unknown executor "${spec.executor}"`);
 }
 
-function authorizeSelection(output: unknown): unknown {
+function authorizeSelection(output: unknown, candidates: ExecutionEnvelope['candidates']): unknown {
   if (isRecord(output) && output['status'] === 'selected' && isRef(output['selected'])) {
-    return { ...output, consId: output['selected'].consId, revision: output['selected'].revision, authorized: true };
+    const selected = output['selected'];
+    const hit = candidates.find((c) => c.ref.consId === selected.consId && c.ref.revision === selected.revision);
+    return {
+      ...output,
+      consId: selected.consId,
+      revision: selected.revision,
+      title: hit !== undefined ? hit.title : '',
+      authorized: true,
+    };
   }
   return output;
 }
@@ -619,6 +627,9 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       actionRef = await resolveAction(deps.store, node, run.state);
     } catch (err) {
       return failRun(deps, run, null, codeOf(err), messageOf(err));
+    }
+    if (node.actionFrom !== undefined && node.allowedActionIds !== undefined && !node.allowedActionIds.includes(actionRef.consId)) {
+      return failRun(deps, run, null, 'unauthorized_action', `action ${actionRef.consId} is outside the allowed action set of node "${nodeId}"`);
     }
     const actionRev = await readRevision(deps.store, actionRef);
     let actionSpec = actionRev.spec;
@@ -724,7 +735,7 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       return failRun(deps, run, step, 'schema_mismatch', transition.error);
     }
     const committed: Step = { ...step, status: 'succeeded', output };
-    const committedOutput = authorizeSelection(output);
+    const committedOutput = authorizeSelection(output, candidates);
     const committedStep: Step = { ...committed, output: committedOutput };
     const nextState = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
     const selectionLike = isRecord(output) && (output['status'] === 'selected' || output['status'] === 'no_candidate');

@@ -12,6 +12,7 @@ import type { EngineDeps } from '../../src/engine/executor.js';
 import { createMockLlm } from '../../src/llm/mock.js';
 import type { ConsRef, LlmRequest, Run } from '../../src/types.js';
 import { DEFAULT_BUDGET } from '../../src/types.js';
+import { EXEC_SUMMARY_PREFIX, requireCorpusMarker, requireExecutionSummaryMarker } from './mock-contract.js';
 
 const M1_TITLE = '嵌套位置描述拆解';
 const M1_INSTRUCTIONS = '识别被描述的中心对象，逐层提取位置修饰及其关系，保留完整表达。';
@@ -107,12 +108,15 @@ function makeHandler() {
     const action = actionConsId(req.userPrompt);
     const p = req.userPrompt;
     if (action === 'seed.make_query') {
+      requireCorpusMarker(p, action);
       return { queries: ['拆解', '位置关系'], roles: ['action'], anchorIds: [] };
     }
     if (action === 'seed.select_action') {
+      requireCorpusMarker(p, action);
       return selection('selected', { consId: 'seed.decompose', revision: 1 }, true);
     }
     if (action === 'seed.select_method') {
+      requireCorpusMarker(p, action);
       const input = jsonBlocks(p).find((b) => 'defaultMethod' in b && 'candidates' in b) ?? {};
       const candidates = Array.isArray(input['candidates']) ? (input['candidates'] as Array<Record<string, unknown>>) : [];
       const m1 = candidates.find((c) => c['title'] === M1_TITLE && c['ref'] !== undefined) as { ref: ConsRef } | undefined;
@@ -123,13 +127,14 @@ function makeHandler() {
       return selection('selected', fallback ?? null, true);
     }
     if (action === 'seed.decompose') {
+      const marker = requireCorpusMarker(p, action);
       return {
         artifacts: [
           { tempId: 'a1', kind: 'object', content: { title: '中心对象' } },
           { tempId: 'a2', kind: 'proposition', content: { text: '中心对象具有多层位置修饰' } },
         ],
         links: [],
-        executionSummary: '拆解了输入句子的组成与位置关系。',
+        executionSummary: `拆解了输入句子的组成与位置关系。${EXEC_SUMMARY_PREFIX}${marker}`,
       };
     }
     if (action === 'seed.prepare_connections') {
@@ -145,6 +150,7 @@ function makeHandler() {
       };
     }
     if (action === 'seed.extract_method') {
+      requireExecutionSummaryMarker(p, action);
       const input = jsonBlocks(p).find((b) => 'methodUsed' in b) ?? {};
       const methodUsed = input['methodUsed'] as ConsRef | undefined;
       if (methodUsed !== undefined && methodUsed.consId === 'seed.decompose.default') {
@@ -227,7 +233,7 @@ describe('seed flow.ingest §17.2 loop without app assembly', () => {
   let m1Id = '';
 
   it('first run completes on the seed flow and internalizes M1', async () => {
-    run1 = await runSeedFlow('flow.ingest', '处理输入语料并内化', { text: '内蒙古高原上的草原上的草很高。' });
+      run1 = await runSeedFlow('flow.ingest', '处理输入语料并内化', { text: '内蒙古高原上的草原上的草很高。UNIQUE_SF1_CORPUS' });
     expect(run1.status).toBe('completed');
     const bindings = await store.listActiveMethodBindings('seed.decompose');
     const dedicated = bindings.find((b) => b.methodId !== 'seed.decompose.default');
@@ -257,7 +263,7 @@ describe('seed flow.ingest §17.2 loop without app assembly', () => {
   });
 
   it('second run retrieves M1, selects M1 and executes with it (§16.2)', async () => {
-    const run2 = await runSeedFlow('flow.ingest', '处理输入语料并内化', { text: '桌子上的盒子上的标签很旧。' });
+    const run2 = await runSeedFlow('flow.ingest', '处理输入语料并内化', { text: '桌子上的盒子上的标签很旧。UNIQUE_SF2_CORPUS' });
     expect(run2.status).toBe('completed');
 
     const events = await store.listEvents(run2.id, { limit: 1000 });

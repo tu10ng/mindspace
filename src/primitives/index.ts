@@ -79,15 +79,17 @@ async function currentRef(store: ConsStoreApi, consId: string): Promise<ConsRef 
 export async function searchCore(
   store: ConsStoreApi,
   queries: CoreQuery[],
-  opts?: { limit?: number; coldStartRole?: ConsRole; runId?: string; stepId?: string; expansionTexts?: string[] },
+  opts?: { limit?: number; coldStartRole?: ConsRole; runId?: string; stepId?: string; expansionTexts?: string[]; allowedIds?: string[] },
 ): Promise<SearchResultItem[]> {
   const qs = queries.slice(0, MAX_QUERIES);
+  const allowedSet = opts !== undefined && opts.allowedIds !== undefined ? new Set(opts.allowedIds) : null;
   const best = new Map<string, SearchResultItem>();
   const collect = async (text: string, roles?: ConsRole[]): Promise<void> => {
     const query: { text: string; roles?: ConsRole[]; limit: number } = { text, limit: PER_QUERY_LIMIT };
     if (roles !== undefined) query.roles = roles;
     const resp = await store.search(query);
     for (const item of resp.items) {
+      if (allowedSet !== null && !allowedSet.has(item.ref.consId)) continue;
       const prev = best.get(item.ref.consId);
       if (prev === undefined || CHANNEL_ORDER[item.channel] > CHANNEL_ORDER[prev.channel]) {
         best.set(item.ref.consId, item);
@@ -104,6 +106,7 @@ export async function searchCore(
     if (count <= COLD_START_LIMIT) {
       const listed = await store.listActiveConsByRole(role, COLD_START_LIMIT);
       for (const l of listed) {
+        if (allowedSet !== null && !allowedSet.has(l.ref.consId)) continue;
         if (!best.has(l.ref.consId)) {
           best.set(l.ref.consId, { ref: l.ref, title: l.title, roles: [role], score: 0, channel: 'assoc' });
         }
@@ -281,7 +284,7 @@ async function receivePrimitive(ctx: StepContext): Promise<unknown> {
     },
   });
   await ctx.store.setStatus(id, 'active');
-  return { consRef: { consId: id, revision: 1 } };
+  return { consRef: { consId: id, revision: 1 }, text };
 }
 
 async function searchPrimitive(ctx: StepContext): Promise<unknown> {
@@ -312,10 +315,12 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
   const limit = typeof input['limit'] === 'number' ? input['limit'] : undefined;
   const anchorIds = Array.isArray(input['anchorIds']) ? input['anchorIds'].filter((v): v is string => typeof v === 'string') : [];
   const anchorQueries: CoreQuery[] = anchorIds.map((id) => ({ text: id, ...(extraRoles === undefined ? {} : { roles: extraRoles }) }));
-  const searchOpts: { limit?: number; coldStartRole?: ConsRole; runId: string; stepId: string; expansionTexts?: string[] } = {
+  const searchOpts: { limit?: number; coldStartRole?: ConsRole; runId: string; stepId: string; expansionTexts?: string[]; allowedIds?: string[] } = {
     runId: ctx.run.id,
     stepId: ctx.step.id,
   };
+  const allowedActionIds = Array.isArray(input['allowedActionIds']) ? input['allowedActionIds'].filter((v): v is string => typeof v === 'string') : [];
+  if (allowedActionIds.length > 0) searchOpts.allowedIds = allowedActionIds;
   if (limit !== undefined) searchOpts.limit = limit;
   if (wantsActions) {
     searchOpts.coldStartRole = 'action';
@@ -323,8 +328,26 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
     const inputText = isRecord(inputState) && typeof inputState['text'] === 'string' ? inputState['text'] : '';
     searchOpts.expansionTexts = [ctx.run.task, inputText.slice(0, 50)];
   }
-  const items = await searchCore(ctx.store, [...anchorQueries, ...queries], searchOpts);
+  let items = await searchCore(ctx.store, [...anchorQueries, ...queries], searchOpts);
+  if (input['contentActionsOnly'] === true) {
+    const filtered: SearchResultItem[] = [];
+    for (const item of items) {
+      const rev = await ctx.store.getRevision(item.ref.consId, item.ref.revision);
+      if (rev !== null && ingestContentCompatible(rev.spec)) filtered.push(item);
+    }
+    items = filtered;
+  }
   return { items };
+}
+
+function ingestContentCompatible(spec: unknown): boolean {
+  if (!isRecord(spec) || spec['kind'] !== 'action' || spec['executor'] !== 'llm') return false;
+  const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
+  const inputRequired = Array.isArray(inputSchema['required']) ? inputSchema['required'] : [];
+  if (!inputRequired.every((k) => k === 'input' || k === 'task')) return false;
+  const outputSchema = isRecord(spec['outputSchema']) ? spec['outputSchema'] : {};
+  const outRequired = Array.isArray(outputSchema['required']) ? outputSchema['required'] : [];
+  return outRequired.includes('artifacts') && outRequired.includes('links');
 }
 
 const KIND_ROLES: Record<string, ConsRole[]> = {
@@ -752,19 +775,32 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
   if (effectiveMethod !== null) {
     usedDefaultFreedom = defaultMethodId !== null && effectiveMethod.consId === defaultMethodId;
   }
+  const inputRev = inputRef !== null ? await ctx.store.getRevision(inputRef.consId, inputRef.revision) : null;
+  const inputText = inputRev !== null ? inputRev.body : '';
+  const artifactDetails: Array<{ ref: ConsRef; title: string; body: string }> = [];
+  for (const ref of artifactRefs) {
+    const r = await ctx.store.getRevision(ref.consId, ref.revision);
+    if (r !== null) artifactDetails.push({ ref, title: r.title, body: r.body });
+  }
+  const selectionBasis =
+    methodSel !== null && typeof methodSel['basisSummary'] === 'string' ? methodSel['basisSummary'] : '';
+  const executionSummary = execOut !== null && typeof execOut['executionSummary'] === 'string' ? execOut['executionSummary'] : '';
   const data = {
     runId,
     task: ctx.run.task,
     inputRef,
+    inputText,
     candidateActions: candidateRefs(selectActionStep),
     selectedAction,
     selectedMethod,
     methodExecuted: execMethodRef,
+    selectionBasis,
     providedTendencies: selectActionStep !== undefined ? selectActionStep.tendencyRefs : [],
     usedTendencies,
     usedDefaultFreedom,
     artifactRefs,
-    executionSummary: execOut !== null && typeof execOut['executionSummary'] === 'string' ? execOut['executionSummary'] : '',
+    artifacts: artifactDetails,
+    executionSummary,
   };
   const id = randomUUID();
   await ctx.store.createCons({
@@ -810,7 +846,7 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
       status: 'active',
     });
   }
-  return { caseRef, usedDefaultFreedom: data.usedDefaultFreedom };
+  return { caseRef, usedDefaultFreedom: data.usedDefaultFreedom, caseData: data };
 }
 
 async function revisePrimitive(ctx: StepContext): Promise<unknown> {

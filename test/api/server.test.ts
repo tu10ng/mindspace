@@ -10,6 +10,7 @@ import { startServer } from '../../src/api/server.js';
 import { createMockLlm } from '../../src/llm/mock.js';
 import type { ConsRef, LlmRequest } from '../../src/types.js';
 import type { Server } from 'node:http';
+import { EXEC_SUMMARY_PREFIX, requireCorpusMarker, requireExecutionSummaryMarker } from '../e2e/mock-contract.js';
 
 function jsonBlocks(prompt: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
@@ -31,26 +32,31 @@ function jsonBlocks(prompt: string): Record<string, unknown>[] {
 function makeHandler() {
   return (req: LlmRequest): unknown => {
     const action = jsonBlocks(req.userPrompt)[0]?.['consId'];
+    const p = req.userPrompt;
     if (action === 'seed.make_query') {
+      requireCorpusMarker(p, String(action));
       return { queries: ['拆解'], roles: ['action'], anchorIds: [] };
     }
     if (action === 'seed.select_action') {
+      requireCorpusMarker(p, String(action));
       return { status: 'selected', selected: { consId: 'seed.decompose', revision: 1 }, usedTendencies: [], basisSummary: 'mock', usedDefaultFreedom: true };
     }
     if (action === 'seed.select_method') {
-      const input = jsonBlocks(req.userPrompt).find((b) => 'defaultMethod' in b && 'candidates' in b) ?? {};
+      requireCorpusMarker(p, String(action));
+      const input = jsonBlocks(p).find((b) => 'defaultMethod' in b && 'candidates' in b) ?? {};
       const fallback = input['defaultMethod'] as ConsRef | undefined;
       return { status: 'selected', selected: fallback ?? null, usedTendencies: [], basisSummary: 'mock', usedDefaultFreedom: true };
     }
     if (action === 'seed.decompose') {
+      const marker = requireCorpusMarker(p, String(action));
       return {
         artifacts: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象' } }],
         links: [],
-        executionSummary: 'mock 拆解',
+        executionSummary: `mock 拆解 ${EXEC_SUMMARY_PREFIX}${marker}`,
       };
     }
     if (action === 'seed.prepare_connections') {
-      const artifactsBlock = jsonBlocks(req.userPrompt).find((b) => 'artifacts' in b) ?? {};
+      const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
       const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
       return {
         candidates: artifacts.map((a) => ({ tempId: a['tempId'], kind: a['kind'], content: a['content'] })),
@@ -58,6 +64,7 @@ function makeHandler() {
       };
     }
     if (action === 'seed.extract_method') {
+      requireExecutionSummaryMarker(p, String(action));
       return { status: 'none' };
     }
     if (action === 'seed.extract_tendency') {
@@ -92,7 +99,7 @@ describe('POST /runs and GET /runs/:id', () => {
     const res = await fetch(`${base}/runs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: '处理输入语料并内化', input: { text: '草原上的草很高。' } }),
+      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: '处理输入语料并内化', input: { text: '草原上的草很高。UNIQUE_API1_CORPUS' } }),
     });
     expect(res.status).toBe(201);
     const created = await res.json() as Record<string, unknown>;
@@ -149,7 +156,7 @@ describe('GET /runs/:id/events pagination', () => {
     const created = await fetch(`${base}/runs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第二句。' } }),
+      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第二句。UNIQUE_API2_CORPUS' } }),
     });
     const runId = ((await created.json()) as { runId: string }).runId;
     const first = await (await fetch(`${base}/runs/${runId}/events?limit=4`)).json() as { events: Array<{ id: number; eventType: string }>; nextAfterId: number };
@@ -169,7 +176,7 @@ describe('GET /runs/:id/steps', () => {
     const runs = await (await fetch(`${base}/runs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第三句。' } }),
+      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第三句。UNIQUE_API3_CORPUS' } }),
     })).json() as { runId: string };
     const res = await fetch(`${base}/runs/${runs.runId}/steps`);
     expect(res.status).toBe(200);
@@ -188,7 +195,7 @@ describe('cons endpoints', () => {
     const created = await (await fetch(`${base}/runs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第四句。' } }),
+      body: JSON.stringify({ entryFlowId: 'flow.ingest', task: 't', input: { text: '第四句。UNIQUE_API4_CORPUS' } }),
     })).json() as { runId: string };
     const detail = await (await fetch(`${base}/runs/${created.runId}`)).json() as { formedCons: ConsRef[] };
     consId = detail.formedCons[0]?.consId ?? '';

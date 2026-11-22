@@ -216,7 +216,7 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
     '保存输入内容为 cons，创建本次处理的对象。输入文本成为后续步骤的处理对象，不在此步骤解释或拆解。',
     'receive',
     schema({ text: { type: 'string' }, task: { type: 'string' } }, ['text']),
-    schema({ consRef: refSchema }, ['consRef']),
+    schema({ consRef: refSchema, text: { type: 'string' } }, ['consRef', 'text']),
     ['create_draft', 'append_event'],
   ),
   primitiveAction(
@@ -240,6 +240,8 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
         limit: { type: 'integer' },
         tendencyScope: { type: 'string', enum: ['action_selection', 'method_selection'] },
         anchorIds: { type: 'array', items: {} },
+        allowedActionIds: { type: 'array', items: { type: 'string' } },
+        contentActionsOnly: { type: 'boolean' },
       },
       ['queries'],
     ),
@@ -322,7 +324,7 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
       },
       ['runId', 'phase'],
     ),
-    schema({ caseRef: refSchema, usedDefaultFreedom: { type: 'boolean' } }, ['caseRef', 'usedDefaultFreedom']),
+    schema({ caseRef: refSchema, usedDefaultFreedom: { type: 'boolean' }, caseData: { type: 'object' } }, ['caseRef', 'usedDefaultFreedom']),
     ['read', 'create_draft', 'append_event'],
   ),
   primitiveAction(
@@ -368,7 +370,7 @@ export const LLM_ACTION_SEEDS: SeedCons[] = [
     '选择方法',
     '从候选方法集合中选择一个方法 ID/版本，或采用已提供的默认方法。选择结果必须引用本次候选集的具体版本。',
     schema(
-      { candidates: { type: 'array', items: {} }, defaultMethod: refSchema, input: {}, task: { type: 'string' } },
+      { candidates: { type: 'array', items: {} }, defaultMethod: refSchema, input: {}, task: { type: 'string' }, selectedActionTitle: { type: 'string' } },
       ['candidates', 'input', 'task'],
     ),
     selectionOutput,
@@ -411,7 +413,16 @@ export const LLM_ACTION_SEEDS: SeedCons[] = [
     'seed.extract_method',
     '从案例形成方法描述',
     '从具体执行案例形成可复用方法的草案，或返回 none。actionId 必须是本次实际执行的动作；从具体执行中形成参数化做法，不以抽象描述替代案例。',
-    schema({ caseRef: refSchema, methodUsed: refSchema, executionSummary: { type: 'string' } }, ['caseRef']),
+    schema(
+      {
+        caseRef: refSchema,
+        methodUsed: refSchema,
+        executionSummary: { type: 'string' },
+        selectionBasis: { type: 'string' },
+        caseData: { type: 'object' },
+      },
+      ['caseRef', 'executionSummary'],
+    ),
     schema(
       {
         status: { type: 'string', enum: ['none', 'proposed'] },
@@ -547,10 +558,13 @@ const flowIngest: FlowSpec = {
     },
     search_actions: {
       actionId: 'seed.search',
+      allowedActionIds: ['seed.decompose', 'seed.classify', 'seed.reference_case'],
       inputBindings: {
         queries: { source: 'state', path: 'actionQuery.queries' },
         roles: { source: 'literal', value: ['action'] },
         anchorIds: { source: 'state', path: 'actionQuery.anchorIds' },
+        allowedActionIds: { source: 'literal', value: ['seed.decompose', 'seed.classify', 'seed.reference_case'] },
+        contentActionsOnly: { source: 'literal', value: true },
       },
       outputKey: 'actionCandidates',
       next: 'search_action_tendencies',
@@ -603,6 +617,7 @@ const flowIngest: FlowSpec = {
         defaultMethod: { source: 'state', path: 'methodCandidates.defaultMethod' },
         input: { source: 'state', path: 'inputCons' },
         task: { source: 'run', path: 'task' },
+        selectedActionTitle: { source: 'state', path: 'actionSelection.title' },
       },
       outputKey: 'methodSelection',
       next: 'execute_action',
@@ -657,6 +672,7 @@ const flowIngest: FlowSpec = {
       actionId: 'flow.internalize',
       inputBindings: {
         caseRef: { source: 'state', path: 'mainCase.caseRef' },
+        caseData: { source: 'state', path: 'mainCase.caseData' },
         actionSelection: { source: 'state', path: 'actionSelection' },
         methodSelection: { source: 'state', path: 'methodSelection' },
         connected: { source: 'state', path: 'connectedContent.connected' },
@@ -695,7 +711,9 @@ const flowInternalize: FlowSpec = {
       inputBindings: {
         caseRef: { source: 'state', path: 'internalCase.caseRef' },
         methodUsed: { source: 'state', path: 'methodSelection.selected' },
-        executionSummary: { source: 'state', path: 'methodSelection.basisSummary' },
+        executionSummary: { source: 'state', path: 'caseData.executionSummary' },
+        selectionBasis: { source: 'state', path: 'methodSelection.basisSummary' },
+        caseData: { source: 'state', path: 'caseData' },
       },
       outputKey: 'methodProposal',
       transitions: [{ field: 'status', equals: 'none', next: 'finish' }],
@@ -748,7 +766,9 @@ const flowInternalize: FlowSpec = {
       inputBindings: {
         caseRef: { source: 'state', path: 'internalCase.caseRef' },
         methodUsed: { source: 'state', path: 'methodSelection.selected' },
-        executionSummary: { source: 'state', path: 'methodSelection.basisSummary' },
+        executionSummary: { source: 'state', path: 'caseData.executionSummary' },
+        selectionBasis: { source: 'state', path: 'methodSelection.basisSummary' },
+        caseData: { source: 'state', path: 'caseData' },
       },
       outputKey: 'methodProposalAlt',
       transitions: [{ field: 'status', equals: 'none', next: 'finish' }],
