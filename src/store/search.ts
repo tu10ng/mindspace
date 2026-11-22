@@ -52,7 +52,7 @@ function currentRevisionRow(db: StoreDb['db'], consId: string): Row | undefined 
     .prepare(
       `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
        FROM cons c
-       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.current_revision
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.id = ?`,
     )
     .get(consId) as Row | undefined;
@@ -84,7 +84,7 @@ function exactChannel(ctx: StoreDb, norm: string, column: 'aliases_json' | 'sear
     .prepare(
       `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
        FROM cons c
-       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.current_revision
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active'
          AND EXISTS (SELECT 1 FROM json_each(r.${column}) e WHERE lower(e.value) = ?)
        ORDER BY c.id
@@ -99,7 +99,7 @@ function titleChannel(ctx: StoreDb, norm: string): Candidate[] {
     .prepare(
       `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
        FROM cons c
-       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.current_revision
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active' AND lower(r.title) = ?
        ORDER BY c.id
        LIMIT ${CHANNEL_FETCH_LIMIT}`,
@@ -258,10 +258,10 @@ export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
 
   const revisions = new Map<string, number>();
   for (const item of items) {
-    const row = ctx.db.prepare('SELECT current_revision FROM cons WHERE id = ?').get(item.ref.consId) as
-      | { current_revision: number }
+    const row = ctx.db.prepare('SELECT active_revision FROM cons WHERE id = ?').get(item.ref.consId) as
+      | { active_revision: number }
       | undefined;
-    if (row !== undefined) revisions.set(item.ref.consId, row.current_revision);
+    if (row !== undefined) revisions.set(item.ref.consId, row.active_revision);
   }
   for (const item of items) {
     item.ref.revision = revisions.get(item.ref.consId) ?? 1;
@@ -283,7 +283,7 @@ export function countActiveByRoleImpl(ctx: StoreDb, role: ConsRole): number {
     .prepare(
       `SELECT COUNT(*) AS n
        FROM cons c
-       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.current_revision
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active'
          AND EXISTS (SELECT 1 FROM json_each(r.roles_json) e WHERE e.value = ?)`,
     )
@@ -298,9 +298,9 @@ export function listActiveConsByRoleImpl(
 ): Array<{ ref: ConsRef; title: string }> {
   const rows = ctx.db
     .prepare(
-      `SELECT c.id AS cons_id, c.current_revision, r.title
+      `SELECT c.id AS cons_id, c.active_revision, r.title
        FROM cons c
-       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.current_revision
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active'
          AND EXISTS (SELECT 1 FROM json_each(r.roles_json) e WHERE e.value = ?)
        ORDER BY c.id
@@ -308,7 +308,7 @@ export function listActiveConsByRoleImpl(
     )
     .all(role, limit) as Row[];
   return rows.map((row) => ({
-    ref: { consId: row.cons_id as string, revision: row.current_revision as number },
+    ref: { consId: row.cons_id as string, revision: row.active_revision as number },
     title: row.title as string,
   }));
 }

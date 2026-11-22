@@ -10,6 +10,7 @@ export class FakeStore {
   revisions: Map<string, ConsRevision> = new Map();
   bindings: Map<string, ExecutionBinding> = new Map();
   idempotencyKeys: Set<string> = new Set();
+  idempotencyResults: Map<string, unknown> = new Map();
   methodBindings: MethodBinding[] = [];
   runs: Map<string, Run> = new Map();
   steps: Map<string, Step> = new Map();
@@ -20,7 +21,7 @@ export class FakeStore {
 
   async createCons(revision: Omit<ConsRevision, 'revision' | 'createdAt'>, opts?: { stableId?: string }): Promise<Cons> {
     const id = opts?.stableId ?? `c${String(this.cons.size + 1)}`;
-    const cons: Cons = { id, currentRevision: 1, status: 'active', createdAt: '2026-01-01T00:00:00Z' };
+    const cons: Cons = { id, currentRevision: 1, activeRevision: 1, status: 'active', createdAt: '2026-01-01T00:00:00Z' };
     this.cons.set(id, cons);
     const rev: ConsRevision = { ...revision, consId: id, revision: 1, createdAt: '2026-01-01T00:00:00Z' };
     this.revisions.set(this.revKey(id, 1), rev);
@@ -36,6 +37,9 @@ export class FakeStore {
     const rev: ConsRevision = { ...revision, consId, revision: next, createdAt: '2026-01-01T00:00:00Z' };
     this.revisions.set(this.revKey(consId, next), rev);
     cons.currentRevision = next;
+    if (cons.status !== 'active') {
+      cons.activeRevision = next;
+    }
     return rev;
   }
 
@@ -61,6 +65,14 @@ export class FakeStore {
     if (cons !== undefined) {
       cons.status = status;
     }
+  }
+
+  async activateRevision(consId: string, revision: number): Promise<void> {
+    const cons = this.cons.get(consId);
+    if (cons === undefined || !this.revisions.has(this.revKey(consId, revision))) {
+      throw new Error(`revision ${consId}@${String(revision)} not found`);
+    }
+    cons.activeRevision = revision;
   }
 
   async createEdge(edge: Omit<ConsEdge, 'id'>): Promise<ConsEdge> {
@@ -114,6 +126,16 @@ export class FakeStore {
 
   async hasIdempotencyKey(key: string): Promise<boolean> {
     return this.idempotencyKeys.has(key);
+  }
+
+  async getIdempotencyResult(key: string): Promise<unknown> {
+    return this.idempotencyResults.get(key) ?? null;
+  }
+
+  async putIdempotencyResult(key: string, result: unknown): Promise<void> {
+    if (!this.idempotencyResults.has(key)) {
+      this.idempotencyResults.set(key, result);
+    }
   }
 
   async setMethodBinding(actionId: string, methodId: string, methodRevision: number, active: boolean): Promise<void> {
@@ -203,9 +225,9 @@ export class FakeStore {
       if (cons.status !== 'active') {
         continue;
       }
-      const rev = this.revisions.get(this.revKey(cons.id, cons.currentRevision));
+      const rev = this.revisions.get(this.revKey(cons.id, cons.activeRevision));
       if (rev !== undefined && rev.roles.includes(role)) {
-        out.push({ ref: { consId: cons.id, revision: cons.currentRevision }, title: rev.title });
+        out.push({ ref: { consId: cons.id, revision: cons.activeRevision }, title: rev.title });
       }
     }
     return out;

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
   ActionSpec,
+  Cons,
   ConsRef,
   ConsRevision,
   ConsRole,
@@ -13,6 +14,7 @@ import type {
 import type { ConsStoreApi } from '../store/api.js';
 import type { PrimitiveFn, StepContext } from '../engine/executor.js';
 import { validateFlow } from '../engine/flow.js';
+import { findUnsupportedKeywords } from '../schema.js';
 
 export const REL_METHOD_OF = 'rel.method_of';
 export const REL_USED_METHOD = 'rel.used_method';
@@ -71,9 +73,27 @@ function asRefs(value: unknown): ConsRef[] {
   return value.filter(isRef);
 }
 
-async function currentRef(store: ConsStoreApi, consId: string): Promise<ConsRef | null> {
+function activeRevisionOf(cons: Cons): number {
+  return cons.activeRevision ?? cons.currentRevision;
+}
+
+async function activeRef(store: ConsStoreApi, consId: string): Promise<ConsRef | null> {
   const cons = await store.getCons(consId);
-  return cons === null ? null : { consId, revision: cons.currentRevision };
+  return cons === null ? null : { consId, revision: activeRevisionOf(cons) };
+}
+
+async function assertEndpointRevision(store: ConsStoreApi, ref: ConsRef, what: string): Promise<void> {
+  if (!Number.isInteger(ref.revision) || ref.revision < 1) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: ${what} ${ref.consId}@${String(ref.revision)} has an invalid revision`);
+  }
+  const rev = await store.getRevision(ref.consId, ref.revision);
+  if (rev === null) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: ${what} revision ${ref.consId}@${String(ref.revision)} not found`);
+  }
+}
+
+export function connectResultKey(stepId: string): string {
+  return `${stepId}:connect`;
 }
 
 export async function searchCore(
@@ -185,10 +205,10 @@ export async function tendencyCandidatesCore(
     if (out.length >= TENDENCY_LIMIT) break;
     const cons = await store.getCons(id);
     if (cons === null || cons.status !== 'active') continue;
-    const rev = await store.getRevision(id, cons.currentRevision);
+    const rev = await store.getRevision(id, activeRevisionOf(cons));
     const spec = rev?.spec;
     if (!isRecord(spec) || spec['kind'] !== 'tendency' || spec['scope'] !== scope) continue;
-    out.push({ consId: id, revision: cons.currentRevision });
+    out.push({ consId: id, revision: activeRevisionOf(cons) });
   }
   return out.sort((a, b) => (a.consId < b.consId ? -1 : a.consId > b.consId ? 1 : 0));
 }
@@ -232,7 +252,7 @@ export async function methodCandidatesCore(
   }
   let defaultMethod: ConsRef | null = null;
   if (defaultId !== undefined) {
-    const ref = await currentRef(store, defaultId);
+    const ref = await activeRef(store, defaultId);
     if (ref !== null) {
       defaultMethod = ref;
       if (!items.some((i) => i.ref.consId === defaultId)) {
@@ -268,23 +288,30 @@ export async function methodCandidatesCore(
 async function receivePrimitive(ctx: StepContext): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
   const text = asString(input['text'], '');
-  const id = randomUUID();
-  await ctx.store.createCons({
-    consId: id,
-    title: text.slice(0, 40) || '输入',
-    roles: ['object'],
-    body: text,
-    aliases: [],
-    searchTerms: [],
-    provenance: {
-      source: 'input',
-      runId: ctx.run.id,
-      stepId: ctx.step.id,
-      sourceRefs: [],
-    },
+  return ctx.store.transaction(async () => {
+    const key = `${ctx.step.id}:0`;
+    const saved = await ctx.store.getIdempotencyResult(key);
+    if (saved !== null) return saved;
+    const id = randomUUID();
+    await ctx.store.createCons({
+      consId: id,
+      title: text.slice(0, 40) || '输入',
+      roles: ['object'],
+      body: text,
+      aliases: [],
+      searchTerms: [],
+      provenance: {
+        source: 'input',
+        runId: ctx.run.id,
+        stepId: ctx.step.id,
+        sourceRefs: [],
+      },
+    });
+    await ctx.store.setStatus(id, 'active');
+    const output = { consRef: { consId: id, revision: 1 }, text };
+    await ctx.store.putIdempotencyResult(key, output);
+    return output;
   });
-  await ctx.store.setStatus(id, 'active');
-  return { consRef: { consId: id, revision: 1 }, text };
 }
 
 async function searchPrimitive(ctx: StepContext): Promise<unknown> {
@@ -363,13 +390,20 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
   const candidates = Array.isArray(input['candidates']) ? input['candidates'] : [];
   const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
-  let opIndex = 0;
   await ctx.store.transaction(async () => {
+    let opIndex = 0;
     for (const c of candidates) {
       if (!isRecord(c)) continue;
       const tempId = asString(c['tempId'], '');
       const kind = asString(c['kind'], 'object');
       const content = isRecord(c['content']) ? c['content'] : {};
+      const key = `${ctx.step.id}:${String(opIndex)}`;
+      opIndex += 1;
+      const saved = await ctx.store.getIdempotencyResult(key);
+      if (saved !== null && isRecord(saved) && isRef(saved['consRef'])) {
+        formed.push({ tempId, consRef: saved['consRef'] });
+        continue;
+      }
       const id = randomUUID();
       const title = asString(content['title'], tempId || id);
       const revInput: Omit<ConsRevision, 'revision' | 'createdAt'> = {
@@ -393,9 +427,9 @@ async function formPrimitive(ctx: StepContext): Promise<unknown> {
         revInput.spec = content['spec'] as unknown as NonNullable<ConsRevision['spec']>;
       }
       await ctx.store.createCons(revInput);
-      await ctx.store.insertIdempotencyKey(`${ctx.step.id}:${String(opIndex)}`);
-      opIndex += 1;
-      formed.push({ tempId, consRef: { consId: id, revision: 1 } });
+      const consRef = { consId: id, revision: 1 };
+      await ctx.store.putIdempotencyResult(key, { consRef });
+      formed.push({ tempId, consRef });
     }
   });
   return { formed };
@@ -413,7 +447,7 @@ async function resolveEndpoint(
   if (typeof value === 'string') {
     const mapped = tempMap.get(value);
     if (mapped !== undefined) return mapped;
-    return currentRef(store, value);
+    return activeRef(store, value);
   }
   return null;
 }
@@ -438,6 +472,15 @@ async function validateActionFiveElements(store: ConsStoreApi, rev: ConsRevision
   if (missing.length > 0) {
     throw new PrimitiveError('schema_mismatch', `schema_mismatch: action draft ${rev.consId} is missing required elements: ${missing.join(', ')}`);
   }
+  for (const schema of [spec.inputSchema, spec.outputSchema]) {
+    const unsupported = findUnsupportedKeywords(schema);
+    if (unsupported.length > 0) {
+      throw new PrimitiveError(
+        'schema_mismatch',
+        `schema_mismatch: action draft ${rev.consId} uses unsupported schema keywords: ${unsupported.join(', ')}`,
+      );
+    }
+  }
   const methodId = spec.defaultMethodId;
   if (methodId === undefined) {
     throw new PrimitiveError('schema_mismatch', `schema_mismatch: action draft ${rev.consId} is missing required elements: defaultMethodId`);
@@ -446,10 +489,25 @@ async function validateActionFiveElements(store: ConsStoreApi, rev: ConsRevision
   if (cons === null) {
     throw new PrimitiveError('schema_mismatch', `schema_mismatch: default method ${methodId} of action ${rev.consId} not found`);
   }
-  const mrev = await store.getRevision(cons.id, cons.currentRevision);
-  const mspec = mrev?.spec;
+  if (cons.status !== 'active') {
+    throw new PrimitiveError('schema_mismatch', `schema_mismatch: default method ${methodId} of action ${rev.consId} is not active`);
+  }
+  const mrev = await store.getRevision(methodId, activeRevisionOf(cons));
+  if (mrev === null) {
+    throw new PrimitiveError('schema_mismatch', `schema_mismatch: default method ${methodId} of action ${rev.consId} has no active revision`);
+  }
+  if (!mrev.roles.includes('method')) {
+    throw new PrimitiveError('schema_mismatch', `schema_mismatch: default method ${methodId} of action ${rev.consId} is not a method spec`);
+  }
+  const mspec = mrev.spec;
   if (!isRecord(mspec) || mspec['kind'] !== 'method') {
     throw new PrimitiveError('schema_mismatch', `schema_mismatch: default method ${methodId} of action ${rev.consId} is not a method spec`);
+  }
+  if (mspec['actionId'] !== rev.consId) {
+    throw new PrimitiveError(
+      'unauthorized_effect',
+      `unauthorized_effect: default method ${methodId} of action ${rev.consId} belongs to action ${String(mspec['actionId'])}`,
+    );
   }
 }
 
@@ -534,6 +592,71 @@ export async function validateDynamicActionActivation(
   return actionSpec.executor;
 }
 
+export interface ActivationMeta {
+  activatedBy: string;
+  runId?: string | null;
+  stepId?: string | null;
+}
+
+export async function activateConsInTx(
+  store: ConsStoreApi,
+  consId: string,
+  revision: number,
+  meta: ActivationMeta,
+  opts?: { methodBinding?: boolean },
+): Promise<void> {
+  if (!Number.isInteger(revision) || revision < 1) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: invalid revision ${String(revision)} for ${consId}`);
+  }
+  const rev = await store.getRevision(consId, revision);
+  if (rev === null) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: revision ${consId}@${String(revision)} not found`);
+  }
+  if (rev.roles.includes('action')) {
+    const executor = await validateDynamicActionActivation(store, consId, revision);
+    await store.upsertExecutionBinding({
+      consId,
+      revision,
+      executor,
+      active: true,
+      activatedByStepId: meta.activatedBy,
+    });
+  }
+  if (opts?.methodBinding === true && rev.roles.includes('method')) {
+    const spec = rev.spec;
+    if (isRecord(spec) && spec['kind'] === 'method' && typeof spec['actionId'] === 'string') {
+      const actionId = spec['actionId'];
+      const actionCons = await store.getCons(actionId);
+      if (actionCons === null) {
+        throw new PrimitiveError('unknown_reference', `unknown_reference: method ${consId} references unknown action ${actionId}`);
+      }
+      await store.setMethodBinding(actionId, consId, revision, true);
+      const edges = await store.listEdges(consId, 'from', true);
+      const linked = edges.some((e) => e.relationConsId === REL_METHOD_OF && e.to.consId === actionId);
+      if (!linked) {
+        await store.createEdge({
+          from: { consId, revision },
+          relationConsId: REL_METHOD_OF,
+          to: { consId: actionId, revision: activeRevisionOf(actionCons) },
+          createdByStepId: meta.activatedBy,
+          status: 'active',
+        });
+      }
+    }
+  }
+  const cons = await store.getCons(consId);
+  if (cons === null) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: cons ${consId} not found`);
+  }
+  if (cons.status !== 'active') {
+    await store.setStatus(consId, 'active');
+  }
+  if (activeRevisionOf(cons) !== revision) {
+    await store.activateRevision(consId, revision);
+  }
+  await store.appendEvent('cons_activated', { consId, revision }, meta.runId ?? null, meta.stepId ?? null);
+}
+
 async function resolveMainActionId(ctx: StepContext): Promise<string | null> {
   const sel = ctx.run.state['actionSelection'];
   if (isRecord(sel) && isRef(sel['selected'])) {
@@ -550,6 +673,8 @@ async function resolveMainActionId(ctx: StepContext): Promise<string | null> {
 
 async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
+  const saved = await ctx.store.getIdempotencyResult(connectResultKey(stepId));
+  if (saved !== null) return saved;
   const formedRaw = Array.isArray(input['formed']) ? input['formed'] : [];
   const tempMap = new Map<string, ConsRef>();
   const formed: Array<{ tempId: string; consRef: ConsRef }> = [];
@@ -560,18 +685,9 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
     }
   }
   const activate = input['activate'] !== false;
-  const edgeIds: string[] = [];
-  const createdEdgeRefs: Array<{ id: string; from: ConsRef; relationConsId: string; to: ConsRef }> = [];
-  const activatedRefs: ConsRef[] = [];
-  await ctx.store.transaction(async () => {
-    let opIndex = 0;
-    const claim = async (): Promise<boolean> => {
-      const key = `${stepId}:${String(opIndex)}`;
-      opIndex += 1;
-      if (await ctx.store.hasIdempotencyKey(key)) return false;
-      await ctx.store.insertIdempotencyKey(key);
-      return true;
-    };
+  const output = await ctx.store.transaction(async (): Promise<unknown> => {
+    const edgeIds: string[] = [];
+    const createdEdgeRefs: Array<{ id: string; from: ConsRef; relationConsId: string; to: ConsRef }> = [];
     for (const f of formed) {
       const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
       if (rev === null) {
@@ -587,25 +703,25 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
       if (from === null || to === null || typeof rel !== 'string') {
         throw new PrimitiveError('unknown_reference', 'edge endpoint or relation type unresolved');
       }
+      await assertEndpointRevision(ctx.store, from, 'edge endpoint');
+      await assertEndpointRevision(ctx.store, to, 'edge endpoint');
       const relCons = await ctx.store.getCons(rel);
       if (relCons === null) {
         throw new PrimitiveError('unknown_reference', `relation cons ${rel} not found`);
       }
-      const relRev = await ctx.store.getRevision(relCons.id, relCons.currentRevision);
+      const relRev = await ctx.store.getRevision(relCons.id, activeRevisionOf(relCons));
       if (relCons.status !== 'active' || relRev === null || !relRev.roles.includes('relation_type')) {
         throw new PrimitiveError('unauthorized_effect', `unauthorized_effect: relation cons ${rel} is not an active relation_type`);
       }
-      if (await claim()) {
-        const edge = await ctx.store.createEdge({
-          from,
-          relationConsId: rel,
-          to,
-          createdByStepId: stepId,
-          status: 'active',
-        });
-        edgeIds.push(edge.id);
-        createdEdgeRefs.push({ id: edge.id, from, relationConsId: rel, to });
-      }
+      const edge = await ctx.store.createEdge({
+        from,
+        relationConsId: rel,
+        to,
+        createdByStepId: stepId,
+        status: 'active',
+      });
+      edgeIds.push(edge.id);
+      createdEdgeRefs.push({ id: edge.id, from, relationConsId: rel, to });
     }
     const formedIds = new Set(formed.map((f) => f.consRef.consId));
     const mainActionId = await resolveMainActionId(ctx);
@@ -620,6 +736,7 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
           `unauthorized_effect: method binding actionId ${actionId} is not the main action ${mainActionId} executed by this run`,
         );
       }
+      await assertEndpointRevision(ctx.store, methodRef, 'method reference');
       const mrev = await ctx.store.getRevision(methodRef.consId, methodRef.revision);
       if (mrev === null) {
         throw new PrimitiveError('unknown_reference', `method revision ${methodRef.consId}@${String(methodRef.revision)} not found`);
@@ -633,13 +750,15 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
           `unauthorized_effect: method ${methodRef.consId} declares actionId ${String(mrev.spec['actionId'])} but is bound to ${actionId}`,
         );
       }
-      if (await claim()) {
-        await ctx.store.setMethodBinding(actionId, methodRef.consId, methodRef.revision, true);
+      await ctx.store.setMethodBinding(actionId, methodRef.consId, methodRef.revision, true);
+      const methodCons = await ctx.store.getCons(methodRef.consId);
+      if (methodCons !== null && methodCons.status === 'active' && activeRevisionOf(methodCons) !== methodRef.revision) {
+        await ctx.store.activateRevision(methodRef.consId, methodRef.revision);
       }
       const existing = await ctx.store.listEdges(methodRef.consId, 'from', true);
       const actionCons = await ctx.store.getCons(actionId);
       const alreadyLinked = existing.some((x) => x.relationConsId === REL_METHOD_OF && x.to.consId === actionId);
-      if (await claim() && actionCons !== null && !alreadyLinked) {
+      if (actionCons !== null && !alreadyLinked) {
         const edge = await ctx.store.createEdge({
           from: methodRef,
           relationConsId: REL_METHOD_OF,
@@ -651,35 +770,33 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
         createdEdgeRefs.push({ id: edge.id, from: methodRef, relationConsId: REL_METHOD_OF, to: { consId: actionId, revision: actionCons.currentRevision } });
       }
     }
-    for (const f of formed) {
-      if (!activate) continue;
-      const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
-      if (rev === null) continue;
-      if (rev.roles.includes('action')) {
-        const executor = await validateDynamicActionActivation(ctx.store, f.consRef.consId, f.consRef.revision);
-        if (await claim()) {
-          await ctx.store.upsertExecutionBinding({
-            consId: f.consRef.consId,
-            revision: f.consRef.revision,
-            executor,
-            active: true,
-            activatedByStepId: stepId,
-          });
-        }
+    if (activate) {
+      for (const f of formed) {
+        const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
+        if (rev === null || rev.roles.includes('action')) continue;
+        await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
+          activatedBy: stepId,
+          runId: ctx.run.id,
+          stepId,
+        });
       }
-      if (await claim()) {
-        await ctx.store.setStatus(f.consRef.consId, 'active');
-        activatedRefs.push(f.consRef);
+      for (const f of formed) {
+        const rev = await ctx.store.getRevision(f.consRef.consId, f.consRef.revision);
+        if (rev === null || !rev.roles.includes('action')) continue;
+        await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
+          activatedBy: stepId,
+          runId: ctx.run.id,
+          stepId,
+        });
       }
     }
     if (createdEdgeRefs.length > 0) {
       await ctx.store.appendEvent('edges_created', { edges: createdEdgeRefs }, ctx.run.id, stepId);
     }
-    for (const r of activatedRefs) {
-      await ctx.store.appendEvent('cons_activated', { consId: r.consId, revision: r.revision }, ctx.run.id, stepId);
-    }
+    return { connected: formed.map((f) => f.consRef), edges: edgeIds };
   });
-  return { connected: formed.map((f) => f.consRef), edges: edgeIds };
+  await ctx.store.putIdempotencyResult(connectResultKey(stepId), output);
+  return output;
 }
 
 function outputOf(step: Step | undefined): Record<string, unknown> | null {
@@ -722,7 +839,7 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
       return { caseRef: focus, usedDefaultFreedom: await caseDerivedFreedom(ctx.store, focus, methodSelection) };
     }
     if (typeof focus === 'string') {
-      const ref = await currentRef(ctx.store, focus);
+      const ref = await activeRef(ctx.store, focus);
       if (ref !== null) {
         return { caseRef: ref, usedDefaultFreedom: await caseDerivedFreedom(ctx.store, ref, methodSelection) };
       }
@@ -760,7 +877,7 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
   }
   const usedTendencies: ConsRef[] = [];
   for (const id of tendencyIds) {
-    const ref = await currentRef(ctx.store, id);
+    const ref = await activeRef(ctx.store, id);
     if (ref !== null) usedTendencies.push(ref);
   }
   const execMethodRef = execStep !== undefined && execStep.methodRef !== undefined ? execStep.methodRef : null;
@@ -803,50 +920,58 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
     executionSummary,
   };
   const id = randomUUID();
-  await ctx.store.createCons({
-    consId: id,
-    title: `案例：${ctx.run.task.slice(0, 30)}`,
-    roles: ['case'],
-    body: JSON.stringify(data),
-    aliases: [],
-    searchTerms: [],
-    provenance: {
-      source: 'execution',
-      runId,
-      stepId: ctx.step.id,
-      sourceRefs: inputRef !== null ? [inputRef] : [],
-    },
+  const output = await ctx.store.transaction(async (): Promise<unknown> => {
+    const key = `${ctx.step.id}:0`;
+    const savedResult = await ctx.store.getIdempotencyResult(key);
+    if (savedResult !== null) return savedResult;
+    await ctx.store.createCons({
+      consId: id,
+      title: `案例：${ctx.run.task.slice(0, 30)}`,
+      roles: ['case'],
+      body: JSON.stringify(data),
+      aliases: [],
+      searchTerms: [],
+      provenance: {
+        source: 'execution',
+        runId,
+        stepId: ctx.step.id,
+        sourceRefs: inputRef !== null ? [inputRef] : [],
+      },
+    });
+    await ctx.store.setStatus(id, 'active');
+    const caseRef = { consId: id, revision: 1 };
+    if (inputRef !== null) {
+      await ctx.store.createEdge({
+        from: caseRef,
+        relationConsId: REL_DERIVED_FROM,
+        to: inputRef,
+        createdByStepId: ctx.step.id,
+        status: 'active',
+      });
+    }
+    if (execStep !== undefined && execStep.methodRef !== undefined) {
+      await ctx.store.createEdge({
+        from: caseRef,
+        relationConsId: REL_USED_METHOD,
+        to: execStep.methodRef,
+        createdByStepId: ctx.step.id,
+        status: 'active',
+      });
+    }
+    for (const t of usedTendencies) {
+      await ctx.store.createEdge({
+        from: caseRef,
+        relationConsId: REL_USED_TENDENCY,
+        to: t,
+        createdByStepId: ctx.step.id,
+        status: 'active',
+      });
+    }
+    const written = { caseRef, usedDefaultFreedom: data.usedDefaultFreedom, caseData: data };
+    await ctx.store.putIdempotencyResult(key, written);
+    return written;
   });
-  await ctx.store.setStatus(id, 'active');
-  const caseRef = { consId: id, revision: 1 };
-  if (inputRef !== null) {
-    await ctx.store.createEdge({
-      from: caseRef,
-      relationConsId: REL_DERIVED_FROM,
-      to: inputRef,
-      createdByStepId: ctx.step.id,
-      status: 'active',
-    });
-  }
-  if (execStep !== undefined && execStep.methodRef !== undefined) {
-    await ctx.store.createEdge({
-      from: caseRef,
-      relationConsId: REL_USED_METHOD,
-      to: execStep.methodRef,
-      createdByStepId: ctx.step.id,
-      status: 'active',
-    });
-  }
-  for (const t of usedTendencies) {
-    await ctx.store.createEdge({
-      from: caseRef,
-      relationConsId: REL_USED_TENDENCY,
-      to: t,
-      createdByStepId: ctx.step.id,
-      status: 'active',
-    });
-  }
-  return { caseRef, usedDefaultFreedom: data.usedDefaultFreedom, caseData: data };
+  return output;
 }
 
 async function revisePrimitive(ctx: StepContext): Promise<unknown> {
@@ -855,6 +980,11 @@ async function revisePrimitive(ctx: StepContext): Promise<unknown> {
   const expectedRevision = typeof input['expectedRevision'] === 'number' ? input['expectedRevision'] : -1;
   const revision = isRecord(input['revision']) ? input['revision'] : {};
   const consRef = await ctx.store.transaction(async (): Promise<ConsRef> => {
+    const key = `${ctx.step.id}:0`;
+    const saved = await ctx.store.getIdempotencyResult(key);
+    if (saved !== null && isRecord(saved) && isRef(saved['consRef'])) {
+      return saved['consRef'];
+    }
     const cons = await ctx.store.getCons(consId);
     if (cons === null) {
       throw new PrimitiveError('unknown_reference', `cons ${consId} not found`);
@@ -888,8 +1018,9 @@ async function revisePrimitive(ctx: StepContext): Promise<unknown> {
       fields.spec = old.spec;
     }
     const created = await ctx.store.createRevision(consId, fields);
-    await ctx.store.insertIdempotencyKey(`${ctx.step.id}:0`);
-    return { consId, revision: created.revision };
+    const out = { consId, revision: created.revision };
+    await ctx.store.putIdempotencyResult(key, { consRef: out });
+    return out;
   });
   return { consRef };
 }

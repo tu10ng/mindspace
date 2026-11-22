@@ -1,6 +1,6 @@
 import type { ConsRef, ConsRevision } from '../types.js';
 import type { PrimitiveFn, StepContext } from '../engine/executor.js';
-import { createPrimitives, isRecord, isRef, PrimitiveError } from '../primitives/index.js';
+import { connectResultKey, createPrimitives, isRecord, isRef, PrimitiveError } from '../primitives/index.js';
 
 function rewriteTempRefs(value: unknown, map: Map<string, ConsRef>): { value: unknown; changed: boolean } {
   if (typeof value === 'string') {
@@ -34,6 +34,8 @@ function rewriteTempRefs(value: unknown, map: Map<string, ConsRef>): { value: un
 }
 
 async function wrappedConnect(base: { run: PrimitiveFn }, ctx: StepContext, stepId: string): Promise<unknown> {
+  const replay = await ctx.store.getIdempotencyResult(connectResultKey(stepId));
+  if (replay !== null) return replay;
   const input = isRecord(ctx.envelope.input) ? { ...ctx.envelope.input } : {};
   const tempMap = new Map<string, ConsRef>();
   const formedRaw = Array.isArray(input['formed']) ? input['formed'] : [];

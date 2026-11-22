@@ -190,6 +190,14 @@ const MIGRATIONS: Migration[] = [
       db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_attempts_step_attempt ON llm_attempts(step_id, attempt_no)');
     },
   },
+  {
+    version: 3,
+    name: 'cons_active_revision',
+    apply: (db) => {
+      db.exec('ALTER TABLE cons ADD COLUMN active_revision INTEGER NOT NULL DEFAULT 0');
+      db.exec('UPDATE cons SET active_revision = current_revision');
+    },
+  },
 ];
 
 export function openDb(path: string): StoreDb {

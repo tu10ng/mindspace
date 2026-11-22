@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createPrimitives } from '../../src/primitives/index.js';
+import { createSeedPrimitives } from '../../src/seed/runtime.js';
 import { makeCtx, makeStore } from './helpers.js';
 import type { ConsStoreApi } from '../../src/store/api.js';
 import type { ConsRef } from '../../src/types.js';
@@ -36,7 +37,7 @@ describe('connect primitive', () => {
     const method = await formOne('method', {
       title: '比较对象默认方法',
       instructions: '逐项对比两个对象。',
-      spec: { kind: 'method', actionId: 'pending', instructions: '逐项对比两个对象。', applicabilityText: '需要比较时。' },
+      spec: { kind: 'method', actionId: 'x1', instructions: '逐项对比两个对象。', applicabilityText: '需要比较时。' },
       origin: 'llm',
     }, 'm');
     const ref = await formOne('action', {
@@ -50,14 +51,18 @@ describe('connect primitive', () => {
         executor: 'llm',
         allowedEffects: ['return_artifacts'],
         freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
-        defaultMethodId: method.consId,
+        defaultMethodId: 'm',
       },
       origin: 'llm',
     });
-    const out = (await connect({ formed: [{ tempId: 'm', consRef: method }, { tempId: 'x1', consRef: ref }], activate: true })) as {
+    const seededConnect = createSeedPrimitives()['connect'];
+    const ctx = makeCtx(store, { formed: [{ tempId: 'm', consRef: method }, { tempId: 'x1', consRef: ref }], activate: true });
+    const out = (await seededConnect?.run(ctx, ctx.step.id)) as {
       connected: ConsRef[];
     };
-    expect(out.connected).toEqual([method, ref]);
+    expect(out.connected).toHaveLength(2);
+    expect(out.connected.map((c) => c.consId)).toEqual([method.consId, ref.consId]);
+    expect(out.connected.every((c) => c.revision === 2)).toBe(true);
     const cons = await store.getCons(ref.consId);
     expect(cons?.status).toBe('active');
     const binding = await store.getActiveExecutionBinding(ref.consId);
@@ -149,6 +154,36 @@ describe('connect primitive', () => {
     expect(await store.listEdges(a.consId, 'both', false)).toEqual([]);
   });
 
+  it('rejects edges whose endpoint revision does not exist or is not a positive integer (F13)', async () => {
+    const a = await formOne('object', { title: '端点校验甲', origin: 'llm' }, 'a');
+    const b = await formOne('object', { title: '端点校验乙', origin: 'llm' }, 'b');
+    for (const badRevision of [999, -1, 0]) {
+      await expect(
+        connect({
+          formed: [
+            { tempId: 'a', consRef: a },
+            { tempId: 'b', consRef: b },
+          ],
+          edges: [{ from: { consId: a.consId, revision: badRevision }, relationConsId: 'rel.describes', to: 'b' }],
+          activate: true,
+        }),
+      ).rejects.toThrow(/unknown_reference/);
+      await expect(
+        connect({
+          formed: [
+            { tempId: 'a', consRef: a },
+            { tempId: 'b', consRef: b },
+          ],
+          edges: [{ from: 'a', relationConsId: 'rel.describes', to: { consId: b.consId, revision: badRevision } }],
+          activate: true,
+        }),
+      ).rejects.toThrow(/unknown_reference/);
+    }
+    expect(await store.listEdges(a.consId, 'both', false)).toEqual([]);
+    expect((await store.getCons(a.consId))?.status).toBe('draft');
+    expect((await store.getCons(b.consId))?.status).toBe('draft');
+  });
+
   it('resolves temp id endpoints to formed refs and creates active edges', async () => {
     const obj = await formOne('object', { title: '目标对象', origin: 'llm' }, 'o');
     const prop = await formOne('proposition', { title: '关于目标的命题', origin: 'llm' }, 'p');
@@ -215,7 +250,7 @@ describe('connect primitive', () => {
     expect((await store.getCons(method.consId))?.status).toBe('draft');
   });
 
-  it('records idempotency keys per write op and re-executing the same step creates no duplicate edges (§14.3)', async () => {
+  it('replays the same step idempotently: same result, no duplicate edges or events (§14.3 / F04)', async () => {
     const a = await formOne('object', { title: '幂等对象甲', origin: 'llm' }, 'a');
     const b = await formOne('object', { title: '幂等对象乙', origin: 'llm' }, 'b');
     const ctx = makeCtx(store, {
@@ -226,14 +261,14 @@ describe('connect primitive', () => {
       edges: [{ from: 'a', relationConsId: 'rel.describes', to: 'b' }],
       activate: true,
     });
-    const first = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[] };
+    const first = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[]; connected: ConsRef[] };
     expect(first.edges).toHaveLength(1);
-    expect(await store.hasIdempotencyKey(`${ctx.step.id}:0`)).toBe(true);
-    expect(await store.hasIdempotencyKey(`${ctx.step.id}:1`)).toBe(true);
-    expect(await store.hasIdempotencyKey(`${ctx.step.id}:2`)).toBe(true);
-    const second = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[] };
-    expect(second.edges).toHaveLength(0);
+    const eventsAfterFirst = (await store.listEvents('run-test', { limit: 1000 })).length;
+    const second = (await createPrimitives()['connect']?.run(ctx, ctx.step.id)) as { edges: string[]; connected: ConsRef[] };
+    expect(second).toEqual(first);
     expect((await store.listEdges(a.consId, 'both', false)).length).toBe(1);
+    const eventsAfterSecond = (await store.listEvents('run-test', { limit: 1000 })).length;
+    expect(eventsAfterSecond).toBe(eventsAfterFirst);
   });
 
   it('writes cons_activated and edges_created events inside the connect transaction (§10.6 / §4.1)', async () => {
@@ -288,7 +323,7 @@ describe('connect primitive', () => {
     const method = await formOne('method', {
       title: '流程动作默认方法',
       instructions: '按流程执行。',
-      spec: { kind: 'method', actionId: 'pending', instructions: '按流程执行。', applicabilityText: '' },
+      spec: { kind: 'method', actionId: 'x1', instructions: '按流程执行。', applicabilityText: '' },
       origin: 'llm',
     }, 'm');
     const ref = await formOne('action', {
@@ -301,11 +336,13 @@ describe('connect primitive', () => {
         flowRef: { consId: 'dyn.flow.ref', revision: 1 },
         allowedEffects: ['return_artifacts'],
         freedom: { chooseWithinCandidates: false, fillExecutionDetails: false, proposeNewDefinitions: false },
-        defaultMethodId: method.consId,
+        defaultMethodId: 'm',
       },
       origin: 'llm',
     });
-    await connect({ formed: [{ tempId: 'm', consRef: method }, { tempId: 'x1', consRef: ref }], activate: true });
+    const seededConnect = createSeedPrimitives()['connect'];
+    const ctx = makeCtx(store, { formed: [{ tempId: 'm', consRef: method }, { tempId: 'x1', consRef: ref }], activate: true });
+    await seededConnect?.run(ctx, ctx.step.id);
     const cons = await store.getCons(ref.consId);
     expect(cons?.status).toBe('active');
     const binding = await store.getActiveExecutionBinding(ref.consId);

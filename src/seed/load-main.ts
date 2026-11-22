@@ -54,6 +54,7 @@ export async function loadSeeds(store: ConsStoreApi): Promise<void> {
         }
         const created = await store.createRevision(seed.id, input);
         revision = created.revision;
+        await store.activateRevision(seed.id, revision);
         changed = true;
       }
       revisions.set(seed.id, revision);

@@ -10,6 +10,7 @@ export interface ConsStoreApi {
   getCons(consId: string): Promise<Cons | null>;
   getRevision(consId: string, revision?: number): Promise<ConsRevision | null>;
   setStatus(consId: string, status: ConsStatus): Promise<void>;
+  activateRevision(consId: string, revision: number): Promise<void>;
 
   createEdge(edge: Omit<ConsEdge, 'id'>): Promise<ConsEdge>;
   listEdges(consId: string, direction?: 'from' | 'to' | 'both', onlyActive?: boolean): Promise<ConsEdge[]>;
@@ -20,6 +21,8 @@ export interface ConsStoreApi {
 
   insertIdempotencyKey(key: string): Promise<void>;
   hasIdempotencyKey(key: string): Promise<boolean>;
+  getIdempotencyResult(key: string): Promise<unknown>;
+  putIdempotencyResult(key: string, result: unknown): Promise<void>;
 
   setMethodBinding(actionId: string, methodId: string, methodRevision: number, active: boolean): Promise<void>;
   listActiveMethodBindings(actionId: string): Promise<MethodBinding[]>;

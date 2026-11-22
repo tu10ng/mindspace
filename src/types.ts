@@ -88,6 +88,7 @@ export interface Provenance {
 export interface Cons {
   id: string;
   currentRevision: number;
+  activeRevision: number;
   status: ConsStatus;
   createdAt: string;
 }

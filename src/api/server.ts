@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { App } from '../app.js';
 import type { ConsRef, ConsRole, ConsRevision, RunBudget, Step } from '../types.js';
-import { validateDynamicActionActivation } from '../primitives/index.js';
+import { activateConsInTx } from '../primitives/index.js';
 
 interface ApiError {
   errorCode: string;
@@ -177,8 +177,8 @@ async function handlePostRevision(app: App, consId: string, body: unknown): Prom
   }
   const expected = body['expectedRevision'];
   const revision = body['revision'];
-  if (typeof expected !== 'number' || !isRecord(revision)) {
-    throw Object.assign(new Error('expectedRevision (integer) and revision (object) are required'), { code: 'schema_mismatch' });
+  if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 1 || !isRecord(revision)) {
+    throw Object.assign(new Error('expectedRevision (positive integer) and revision (object) are required'), { code: 'schema_mismatch' });
   }
   const cons = await app.store.getCons(consId);
   if (cons === null) {
@@ -220,20 +220,12 @@ async function handleActivate(app: App, consId: string): Promise<Record<string, 
   if (cons === null) {
     throw Object.assign(new Error(`cons ${consId} not found`), { code: 'unknown_reference' });
   }
-  const rev = await app.store.getRevision(consId);
-  if (rev !== null && rev.roles.includes('action')) {
-    const executor = await validateDynamicActionActivation(app.store, consId, cons.currentRevision);
-    await app.store.upsertExecutionBinding({
-      consId,
-      revision: cons.currentRevision,
-      executor,
-      active: true,
-      activatedByStepId: 'human-api',
-    });
-  }
-  await app.store.setStatus(consId, 'active');
-  await app.store.appendEvent('human_cons_activated', { consId, revision: cons.currentRevision }, null, null);
-  return { consId, status: 'active' };
+  const revision = cons.currentRevision;
+  await app.store.transaction(async () => {
+    await activateConsInTx(app.store, consId, revision, { activatedBy: 'human-api' }, { methodBinding: true });
+  });
+  await app.store.appendEvent('human_cons_activated', { consId, revision }, null, null);
+  return { consId, status: 'active', revision };
 }
 
 async function route(app: App, req: IncomingMessage, res: ServerResponse): Promise<void> {

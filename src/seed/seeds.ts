@@ -47,6 +47,20 @@ const refSchema: object = {
   additionalProperties: false,
 };
 
+const nullableRefSchema: object = {
+  type: ['object', 'null'],
+  properties: { consId: { type: 'string' }, revision: { type: 'integer' } },
+  required: ['consId', 'revision'],
+  additionalProperties: false,
+};
+
+const endpointSchema: object = {
+  type: ['object', 'string'],
+  properties: { consId: { type: 'string' }, revision: { type: 'integer' } },
+  required: ['consId', 'revision'],
+  additionalProperties: false,
+};
+
 const roleEnum: object = {
   type: 'string',
   enum: [
@@ -56,10 +70,17 @@ const roleEnum: object = {
   ],
 };
 
+const queryItemSchema: object = {
+  type: ['string', 'object'],
+  properties: { text: { type: 'string' }, roles: { type: 'array', items: roleEnum } },
+  required: ['text'],
+  additionalProperties: false,
+};
+
 const selectionOutput: object = schema(
   {
     status: { type: 'string', enum: ['selected', 'no_candidate'] },
-    selected: { oneOf: [refSchema, { type: 'null' }] },
+    selected: nullableRefSchema,
     usedTendencies: { type: 'array', items: { type: 'string' } },
     basisSummary: { type: 'string' },
     usedDefaultFreedom: { type: 'boolean' },
@@ -77,8 +98,6 @@ const formCandidateItem: object = schema(
   ['tempId', 'kind', 'content'],
 );
 
-const endpointSchema: object = { oneOf: [refSchema, { type: 'string' }] };
-
 const edgeItem: object = schema(
   {
     from: endpointSchema,
@@ -91,7 +110,7 @@ const edgeItem: object = schema(
 const methodBindingItem: object = schema(
   {
     actionId: { type: 'string' },
-    methodRef: { oneOf: [refSchema, { type: 'string' }] },
+    methodRef: endpointSchema,
   },
   ['actionId', 'methodRef'],
 );
@@ -228,12 +247,7 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
       {
         queries: {
           type: 'array',
-          items: {
-            oneOf: [
-              { type: 'string' },
-              schema({ text: { type: 'string' }, roles: { type: 'array', items: roleEnum } }, ['text']),
-            ],
-          },
+          items: queryItemSchema,
         },
         roles: { type: 'array', items: roleEnum },
         actionId: { type: 'string' },

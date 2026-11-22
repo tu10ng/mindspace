@@ -241,6 +241,50 @@ describe('transactions', () => {
     );
     expect(new Set(ids.map((c) => c.id)).size).toBe(10);
   });
+
+  it('keeps uncommitted transaction writes invisible to concurrent readers until commit (F08)', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tx = store.transaction(async () => {
+      await store.createCons(revInput({ consId: 'vis.tx', title: '事务内未提交对象' }));
+      await store.setStatus('vis.tx', 'active');
+      await gate;
+    });
+    let readerDone = false;
+    const reader = store.search({ text: '事务内未提交对象' }).then((res) => {
+      readerDone = true;
+      return res;
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(readerDone).toBe(false);
+    release();
+    await tx;
+    const res = await reader;
+    expect(res.items.some((i) => i.ref.consId === 'vis.tx')).toBe(true);
+  });
+
+  it('keeps rolled back transaction writes invisible to concurrent readers (F08)', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tx = store.transaction(async () => {
+      await store.createCons(revInput({ consId: 'vis.rb', title: '回滚对象内容' }));
+      await store.setStatus('vis.rb', 'active');
+      await gate;
+      throw new Error('rollback after gate');
+    });
+    const reader = store.search({ text: '回滚对象内容' });
+    release();
+    await expect(tx).rejects.toThrow('rollback after gate');
+    const res = await reader;
+    expect(res.items.length).toBe(0);
+    expect(await store.getCons('vis.rb')).toBeNull();
+  });
 });
 
 describe('llm attempts', () => {
@@ -363,7 +407,7 @@ describe('search', () => {
     expect(list.map((l) => l.ref.consId)).toEqual(['c1', 'c2']);
   });
 
-  it('reindexes the current revision after a new revision is created', async () => {
+  it('keeps the search index on the active revision until the new revision is activated (F05)', async () => {
     const id = await makeActiveCons({ consId: 'rev.idx', title: '旧标题内容' });
     await store.createRevision(id, {
       title: '全新标题内容',
@@ -373,10 +417,20 @@ describe('search', () => {
       searchTerms: [],
       provenance: { source: 'human', sourceRefs: [] },
     });
+    const cons = await store.getCons(id);
+    expect(cons?.currentRevision).toBe(2);
+    expect(cons?.activeRevision).toBe(1);
+    const stale = await store.search({ text: '全新标题内容' });
+    expect(stale.items.length).toBe(0);
+    const stillOld = await store.search({ text: '旧标题内容' });
+    expect(stillOld.items[0]?.ref.consId).toBe('rev.idx');
+    expect(stillOld.items[0]?.ref.revision).toBe(1);
+    await store.activateRevision(id, 2);
     const hit = await store.search({ text: '全新标题内容' });
     expect(hit.items[0]?.ref.consId).toBe('rev.idx');
-    const stale = await store.search({ text: '旧标题内容' });
-    expect(stale.items.length).toBe(0);
+    expect(hit.items[0]?.ref.revision).toBe(2);
+    const gone = await store.search({ text: '旧标题内容' });
+    expect(gone.items.length).toBe(0);
   });
 });
 

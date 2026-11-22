@@ -15,6 +15,7 @@ export const STATE_KEY_TENDENCY_REFS = 'tendencyRefs';
 export const STATE_KEY_METHOD_SELECTION = 'methodSelection';
 export const STATE_KEY_RUN_INPUT = 'input';
 export const STATE_KEY_CURRENT_NODE = '_currentNode';
+export const STATE_KEY_AUTHORIZATIONS = '_authorizations';
 const NETWORK_RETRIES = 2;
 const REPAIRABLE_CODES: ErrorCode[] = ['invalid_json', 'schema_mismatch', 'unknown_reference'];
 const ERROR_CODE_SET: ReadonlySet<string> = new Set<string>([
@@ -76,6 +77,48 @@ function isFlowSpec(value: unknown): value is import('../types.js').FlowSpec {
 
 function isRef(value: unknown): value is ConsRef {
   return isRecord(value) && typeof value['consId'] === 'string' && typeof value['revision'] === 'number';
+}
+
+interface AuthorizationRecord {
+  consId: string;
+  revision: number;
+  title: string;
+  candidates: ConsRef[];
+}
+
+function authorizationRecordsOf(state: Record<string, unknown>): Record<string, unknown> {
+  const raw = state[STATE_KEY_AUTHORIZATIONS];
+  return isRecord(raw) ? raw : {};
+}
+
+function authorizationFor(state: Record<string, unknown>, key: string): AuthorizationRecord | null {
+  const raw = resolvePath(authorizationRecordsOf(state), key);
+  if (!isRecord(raw) || typeof raw['consId'] !== 'string' || typeof raw['revision'] !== 'number') {
+    return null;
+  }
+  return {
+    consId: raw['consId'],
+    revision: raw['revision'],
+    title: typeof raw['title'] === 'string' ? raw['title'] : '',
+    candidates: asRefArray(raw['candidates']),
+  };
+}
+
+function buildAuthorization(output: unknown, candidates: ExecutionEnvelope['candidates']): AuthorizationRecord | null {
+  if (isRecord(output) && output['status'] === 'selected' && isRef(output['selected'])) {
+    const selected = output['selected'];
+    const hit = candidates.find((c) => c.ref.consId === selected.consId && c.ref.revision === selected.revision);
+    if (hit === undefined) {
+      return null;
+    }
+    return {
+      consId: selected.consId,
+      revision: selected.revision,
+      title: hit.title,
+      candidates: candidates.map((c) => c.ref),
+    };
+  }
+  return null;
 }
 
 function syntheticFlowActionSpec(ref: ConsRef): ActionSpec {
@@ -186,12 +229,12 @@ async function resolveAction(
     ref = { consId: node.actionId, revision: binding.revision };
   } else {
     const key = node.actionFrom ?? '';
-    const raw = resolvePath(state, key);
-    if (!isRecord(raw) || typeof raw['consId'] !== 'string' || typeof raw['revision'] !== 'number' || raw['authorized'] !== true) {
-      throw new StepFailure('unauthorized_action', `actionFrom "${key}" does not reference a verified selection result`);
+    const record = authorizationFor(state, key);
+    if (record === null) {
+      throw new StepFailure('unauthorized_action', `actionFrom "${key}" does not reference a server-authorized selection`);
     }
-    const consId = raw['consId'];
-    const revision = raw['revision'];
+    const consId = record.consId;
+    const revision = record.revision;
     const binding = await store.getExecutionBinding(consId, revision);
     if (binding === null || !binding.active) {
       throw new StepFailure('missing_binding', `no active execution binding for ${consId}@${String(revision)}`);
@@ -553,15 +596,13 @@ async function executeStep(deps: EngineDeps, run: Run, step: Step, envelope: Exe
   throw new StepFailure('config_error', `unknown executor "${spec.executor}"`);
 }
 
-function authorizeSelection(output: unknown, candidates: ExecutionEnvelope['candidates']): unknown {
-  if (isRecord(output) && output['status'] === 'selected' && isRef(output['selected'])) {
-    const selected = output['selected'];
-    const hit = candidates.find((c) => c.ref.consId === selected.consId && c.ref.revision === selected.revision);
+function authorizeSelection(output: unknown, authorization: AuthorizationRecord | null): unknown {
+  if (authorization !== null && isRecord(output)) {
     return {
       ...output,
-      consId: selected.consId,
-      revision: selected.revision,
-      title: hit !== undefined ? hit.title : '',
+      consId: authorization.consId,
+      revision: authorization.revision,
+      title: authorization.title,
       authorized: true,
     };
   }
@@ -651,20 +692,27 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       return failRun(deps, run, null, 'schema_mismatch', inputResult.errors.join('; '));
     }
     let method: { ref: ConsRef; spec: MethodSpec; body: string } | undefined;
-    const stateSelection = run.state[STATE_KEY_METHOD_SELECTION];
-    if (isRecord(stateSelection) && isRef(stateSelection['selected'])) {
-      const selected = stateSelection['selected'];
-      const methodRev = await deps.store.getRevision(selected.consId, selected.revision);
+    const methodAuth = authorizationFor(run.state, STATE_KEY_METHOD_SELECTION);
+    if (methodAuth !== null) {
+      const methodRev = await deps.store.getRevision(methodAuth.consId, methodAuth.revision);
       if (methodRev !== null && isMethodSpec(methodRev.spec) && methodRev.spec.actionId === actionRef.consId) {
-        method = { ref: selected, spec: methodRev.spec, body: methodRev.body };
+        method = { ref: { consId: methodAuth.consId, revision: methodAuth.revision }, spec: methodRev.spec, body: methodRev.body };
       }
     }
     if (method === undefined && typeof actionSpec.defaultMethodId === 'string') {
       const defaultCons = await deps.store.getCons(actionSpec.defaultMethodId);
-      if (defaultCons !== null) {
-        const methodRef: ConsRef = { consId: actionSpec.defaultMethodId, revision: defaultCons.currentRevision };
+      if (defaultCons !== null && defaultCons.status === 'active') {
+        const methodRef: ConsRef = {
+          consId: actionSpec.defaultMethodId,
+          revision: defaultCons.activeRevision ?? defaultCons.currentRevision,
+        };
         const methodRev = await deps.store.getRevision(methodRef.consId, methodRef.revision);
-        if (methodRev !== null && isMethodSpec(methodRev.spec)) {
+        if (
+          methodRev !== null &&
+          methodRev.roles.includes('method') &&
+          isMethodSpec(methodRev.spec) &&
+          methodRev.spec.actionId === actionRef.consId
+        ) {
           method = { ref: methodRef, spec: methodRev.spec, body: methodRev.body };
         }
       }
@@ -735,9 +783,16 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       return failRun(deps, run, step, 'schema_mismatch', transition.error);
     }
     const committed: Step = { ...step, status: 'succeeded', output };
-    const committedOutput = authorizeSelection(output, candidates);
+    const authorization = buildAuthorization(output, candidates);
+    const committedOutput = authorizeSelection(output, authorization);
     const committedStep: Step = { ...committed, output: committedOutput };
-    const nextState = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
+    let nextState: Record<string, unknown> = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
+    if (authorization !== null) {
+      nextState = {
+        ...nextState,
+        [STATE_KEY_AUTHORIZATIONS]: { ...authorizationRecordsOf(run.state), [node.outputKey]: authorization },
+      };
+    }
     const selectionLike = isRecord(output) && (output['status'] === 'selected' || output['status'] === 'no_candidate');
     const selectionBasis = isRecord(output) && typeof output['basisSummary'] === 'string' ? output['basisSummary'] : null;
     const rawUsedTendencies = isRecord(output) && Array.isArray(output['usedTendencies'])

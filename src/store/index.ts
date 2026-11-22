@@ -37,6 +37,7 @@ function rowToCons(row: Row): Cons {
   return {
     id: row.id as string,
     currentRevision: row.current_revision as number,
+    activeRevision: row.active_revision as number,
     status: row.status as ConsStatus,
     createdAt: row.created_at as string,
   };
@@ -183,11 +184,11 @@ export function openStore(path: string): ConsStoreApi {
 
   function reindexSync(consId: string): void {
     db.prepare('DELETE FROM cons_search WHERE cons_id = ?').run(consId);
-    const cons = db.prepare('SELECT status, current_revision FROM cons WHERE id = ?').get(consId) as
+    const cons = db.prepare('SELECT status, active_revision FROM cons WHERE id = ?').get(consId) as
       | Row
       | undefined;
     if (cons === undefined || cons.status !== 'active') return;
-    const revisionNo = cons.current_revision as number;
+    const revisionNo = cons.active_revision as number;
     const rev = db
       .prepare(
         'SELECT title, aliases_json, search_terms_json, applicability_text, body FROM cons_revisions WHERE cons_id = ? AND revision = ?',
@@ -209,14 +210,14 @@ export function openStore(path: string): ConsStoreApi {
   function createConsSync(revision: Omit<ConsRevision, 'revision' | 'createdAt'>, opts?: { stableId?: string }): Cons {
     const id = opts?.stableId ?? revision.consId;
     const createdAt = nowIso();
-    db.prepare('INSERT INTO cons (id, current_revision, status, created_at) VALUES (?, 1, ?, ?)').run(
+    db.prepare('INSERT INTO cons (id, current_revision, active_revision, status, created_at) VALUES (?, 1, 1, ?, ?)').run(
       id,
       'draft',
       createdAt,
     );
     insertRevisionSync({ ...revision, consId: id, revision: 1, createdAt });
     insertEventSync('cons_formed', { consId: id, revision: 1 }, null, null);
-    return { id, currentRevision: 1, status: 'draft', createdAt };
+    return { id, currentRevision: 1, activeRevision: 1, status: 'draft', createdAt };
   }
 
   function createRevisionSync(consId: string, revision: Omit<ConsRevision, 'consId' | 'revision' | 'createdAt'>): ConsRevision {
@@ -228,10 +229,26 @@ export function openStore(path: string): ConsStoreApi {
     const createdAt = nowIso();
     const full: ConsRevision = { ...revision, consId, revision: next, createdAt };
     insertRevisionSync(full);
-    db.prepare('UPDATE cons SET current_revision = ? WHERE id = ?').run(next, consId);
+    if (cons.status === 'active') {
+      db.prepare('UPDATE cons SET current_revision = ? WHERE id = ?').run(next, consId);
+    } else {
+      db.prepare('UPDATE cons SET current_revision = ?, active_revision = ? WHERE id = ?').run(next, next, consId);
+    }
     insertEventSync('cons_revised', { consId, revision: next }, null, null);
-    if (cons.status === 'active') reindexSync(consId);
     return full;
+  }
+
+  function activateRevisionSync(consId: string, revision: number): void {
+    if (!Number.isInteger(revision) || revision < 1) {
+      throw new Error(`invalid revision ${String(revision)} for ${consId}`);
+    }
+    const row = db.prepare('SELECT revision FROM cons_revisions WHERE cons_id = ? AND revision = ?').get(consId, revision) as
+      | Row
+      | undefined;
+    if (row === undefined) throw new Error(`revision ${consId}@${String(revision)} not found`);
+    db.prepare('UPDATE cons SET active_revision = ? WHERE id = ?').run(revision, consId);
+    insertEventSync('cons_revision_activated', { consId, revision }, null, null);
+    reindexSync(consId);
   }
 
   return {
@@ -244,23 +261,26 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async getCons(consId) {
-      const row = db.prepare('SELECT * FROM cons WHERE id = ?').get(consId) as Row | undefined;
-      return row === undefined ? null : rowToCons(row);
+      return write(() => db.prepare('SELECT * FROM cons WHERE id = ?').get(consId) as Row | undefined).then((row) =>
+        row === undefined ? null : rowToCons(row),
+      );
     },
 
     async getRevision(consId, revision) {
-      let rev = revision;
-      if (rev === undefined) {
-        const cons = db.prepare('SELECT current_revision FROM cons WHERE id = ?').get(consId) as
-          | Row
-          | undefined;
-        if (cons === undefined) return null;
-        rev = cons.current_revision as number;
-      }
-      const row = db
-        .prepare('SELECT * FROM cons_revisions WHERE cons_id = ? AND revision = ?')
-        .get(consId, rev) as Row | undefined;
-      return row === undefined ? null : rowToRevision(row);
+      return write(async () => {
+        let rev = revision;
+        if (rev === undefined) {
+          const cons = db.prepare('SELECT active_revision FROM cons WHERE id = ?').get(consId) as
+            | Row
+            | undefined;
+          if (cons === undefined) return null;
+          rev = cons.active_revision as number;
+        }
+        const row = db
+          .prepare('SELECT * FROM cons_revisions WHERE cons_id = ? AND revision = ?')
+          .get(consId, rev) as Row | undefined;
+        return row === undefined ? null : rowToRevision(row);
+      });
     },
 
     async setStatus(consId, status) {
@@ -270,6 +290,10 @@ export function openStore(path: string): ConsStoreApi {
         insertEventSync(status === 'active' ? 'cons_activated' : 'cons_archived', { consId, status }, null, null);
         reindexSync(consId);
       });
+    },
+
+    async activateRevision(consId, revision) {
+      return write(() => activateRevisionSync(consId, revision));
     },
 
     async createEdge(edge) {
@@ -301,21 +325,23 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async listEdges(consId, direction, onlyActive) {
-      const dir = direction ?? 'both';
-      const active = onlyActive ?? true;
-      const clauses: string[] = [];
-      const params: SQLInputValue[] = [];
-      if (dir === 'from' || dir === 'both') {
-        clauses.push('from_id = ?');
-        params.push(consId);
-      }
-      if (dir === 'to' || dir === 'both') {
-        clauses.push('to_id = ?');
-        params.push(consId);
-      }
-      const where = `(${clauses.join(' OR ')})${active ? " AND status = 'active'" : ''}`;
-      const rows = db.prepare(`SELECT * FROM cons_edges WHERE ${where} ORDER BY id`).all(...params) as Row[];
-      return rows.map(rowToEdge);
+      return write(() => {
+        const dir = direction ?? 'both';
+        const active = onlyActive ?? true;
+        const clauses: string[] = [];
+        const params: SQLInputValue[] = [];
+        if (dir === 'from' || dir === 'both') {
+          clauses.push('from_id = ?');
+          params.push(consId);
+        }
+        if (dir === 'to' || dir === 'both') {
+          clauses.push('to_id = ?');
+          params.push(consId);
+        }
+        const where = `(${clauses.join(' OR ')})${active ? " AND status = 'active'" : ''}`;
+        const rows = db.prepare(`SELECT * FROM cons_edges WHERE ${where} ORDER BY id`).all(...params) as Row[];
+        return rows.map(rowToEdge);
+      });
     },
 
     async upsertExecutionBinding(b) {
@@ -336,17 +362,15 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async getActiveExecutionBinding(consId) {
-      const row = db
+      return write(() => db
         .prepare('SELECT * FROM execution_bindings WHERE cons_id = ? AND active = 1 ORDER BY revision DESC LIMIT 1')
-        .get(consId) as Row | undefined;
-      return row === undefined ? null : rowToExecutionBinding(row);
+        .get(consId) as Row | undefined).then((row) => (row === undefined ? null : rowToExecutionBinding(row)));
     },
 
     async getExecutionBinding(consId, revision) {
-      const row = db
+      return write(() => db
         .prepare('SELECT * FROM execution_bindings WHERE cons_id = ? AND revision = ?')
-        .get(consId, revision) as Row | undefined;
-      return row === undefined ? null : rowToExecutionBinding(row);
+        .get(consId, revision) as Row | undefined).then((row) => (row === undefined ? null : rowToExecutionBinding(row)));
     },
 
     async insertIdempotencyKey(key) {
@@ -356,8 +380,28 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async hasIdempotencyKey(key) {
-      const row = db.prepare('SELECT key FROM idempotency_keys WHERE key = ?').get(key) as Row | undefined;
-      return row !== undefined;
+      return write(() => db.prepare('SELECT key FROM idempotency_keys WHERE key = ?').get(key) as Row | undefined).then(
+        (row) => row !== undefined,
+      );
+    },
+
+    async getIdempotencyResult(key) {
+      return write(() => db.prepare('SELECT result_json FROM idempotency_keys WHERE key = ?').get(key) as Row | undefined).then(
+        (row) => {
+          if (row === undefined || row.result_json === null || row.result_json === undefined) return null;
+          return JSON.parse(row.result_json as string) as unknown;
+        },
+      );
+    },
+
+    async putIdempotencyResult(key, result) {
+      return write(() => {
+        db.prepare('INSERT OR IGNORE INTO idempotency_keys (key, result_json, created_at) VALUES (?, ?, ?)').run(
+          key,
+          JSON.stringify(result ?? null),
+          nowIso(),
+        );
+      });
     },
 
     async setMethodBinding(actionId, methodId, methodRevision, active) {
@@ -373,15 +417,16 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async listActiveMethodBindings(actionId) {
-      const rows = db
+      return write(() => db
         .prepare('SELECT * FROM method_bindings WHERE action_id = ? AND active = 1 ORDER BY method_id')
-        .all(actionId) as Row[];
-      return rows.map((row) => ({
-        actionId: row.action_id as string,
-        methodId: row.method_id as string,
-        methodRevision: row.method_revision as number,
-        active: (row.active as number) === 1,
-      }));
+        .all(actionId) as Row[]).then((rows) =>
+        rows.map((row) => ({
+          actionId: row.action_id as string,
+          methodId: row.method_id as string,
+          methodRevision: row.method_revision as number,
+          active: (row.active as number) === 1,
+        })),
+      );
     },
 
     async createRun(run) {
@@ -430,8 +475,9 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async getRun(runId) {
-      const row = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId) as Row | undefined;
-      return row === undefined ? null : rowToRun(row);
+      return write(() => db.prepare('SELECT * FROM runs WHERE id = ?').get(runId) as Row | undefined).then((row) =>
+        row === undefined ? null : rowToRun(row),
+      );
     },
 
     async upsertStep(step) {
@@ -461,15 +507,15 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async getStep(runId, nodeId) {
-      const row = db
+      return write(() => db
         .prepare('SELECT * FROM steps WHERE run_id = ? AND node_id = ? ORDER BY rowid DESC LIMIT 1')
-        .get(runId, nodeId) as Row | undefined;
-      return row === undefined ? null : rowToStep(row);
+        .get(runId, nodeId) as Row | undefined).then((row) => (row === undefined ? null : rowToStep(row)));
     },
 
     async listSteps(runId) {
-      const rows = db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY rowid').all(runId) as Row[];
-      return rows.map(rowToStep);
+      return write(() => db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY rowid').all(runId) as Row[]).then((rows) =>
+        rows.map(rowToStep),
+      );
     },
 
     async appendEvent(eventType, payload, runId, stepId) {
@@ -479,12 +525,14 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async listEvents(runId, opts) {
-      const afterId = opts?.afterId ?? 0;
-      const limit = opts?.limit ?? 100;
-      const rows = db
-        .prepare('SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?')
-        .all(runId, afterId, limit) as Row[];
-      return rows.map(rowToEvent);
+      return write(() => {
+        const afterId = opts?.afterId ?? 0;
+        const limit = opts?.limit ?? 100;
+        const rows = db
+          .prepare('SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?')
+          .all(runId, afterId, limit) as Row[];
+        return rows.map(rowToEvent);
+      });
     },
 
     async insertLlmAttempt(row) {
@@ -513,36 +561,37 @@ export function openStore(path: string): ConsStoreApi {
     },
 
     async getLastLlmSuccess(stepId) {
-      const row = db
+      return write(() => db
         .prepare('SELECT * FROM llm_attempts WHERE step_id = ? AND error_code IS NULL ORDER BY attempt_no DESC LIMIT 1')
-        .get(stepId) as Row | undefined;
-      if (row === undefined) return null;
-      return {
-        stepId: row.step_id as string,
-        attemptNo: row.attempt_no as number,
-        request: row.request_json === null ? null : (JSON.parse(row.request_json as string) as unknown),
-        response: row.response_json === null ? null : (JSON.parse(row.response_json as string) as { text?: unknown }),
-        model: (row.model as string | null) ?? null,
-        usage: row.usage_json === null ? null : (JSON.parse(row.usage_json as string) as { inputTokens: number; outputTokens: number }),
-        latencyMs: (row.latency_ms as number | null) ?? null,
-        errorCode: (row.error_code as string | null) ?? null,
-      };
+        .get(stepId) as Row | undefined).then((row) => {
+        if (row === undefined) return null;
+        return {
+          stepId: row.step_id as string,
+          attemptNo: row.attempt_no as number,
+          request: row.request_json === null ? null : (JSON.parse(row.request_json as string) as unknown),
+          response: row.response_json === null ? null : (JSON.parse(row.response_json as string) as { text?: unknown }),
+          model: (row.model as string | null) ?? null,
+          usage: row.usage_json === null ? null : (JSON.parse(row.usage_json as string) as { inputTokens: number; outputTokens: number }),
+          latencyMs: (row.latency_ms as number | null) ?? null,
+          errorCode: (row.error_code as string | null) ?? null,
+        };
+      });
     },
 
     async search(query: SearchQuery): Promise<SearchResponse> {
-      return searchCons(ctx, query);
+      return write(() => searchCons(ctx, query));
     },
 
     async searchByRole(query, roles) {
-      return searchByRoleImpl(ctx, query, roles);
+      return write(() => searchByRoleImpl(ctx, query, roles));
     },
 
     async countActiveByRole(role) {
-      return countActiveByRoleImpl(ctx, role);
+      return write(() => countActiveByRoleImpl(ctx, role));
     },
 
     async listActiveConsByRole(role, limit) {
-      return listActiveConsByRoleImpl(ctx, role, limit ?? 10000);
+      return write(() => listActiveConsByRoleImpl(ctx, role, limit ?? 10000));
     },
 
     async transaction<T>(fn: () => Promise<T>): Promise<T> {
