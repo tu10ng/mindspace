@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { App } from '../app.js';
-import type { ConsRef, ConsRole, ConsRevision, RunBudget, Step } from '../types.js';
+import type { ConsRef, ConsRole, ConsRevision, ResolutionDecisionInput, RunBudget, Step, SummarizeTopicInput } from '../types.js';
 import { activateConsInTx } from '../primitives/index.js';
 
 interface ApiError {
@@ -103,7 +103,7 @@ async function runDetail(app: App, runId: string): Promise<Record<string, unknow
     }
   }
   const formedCons: ConsRef[] = [];
-  for (const key of ['connectedContent', 'connectedMethod', 'connectedTendency']) {
+  for (const key of ['connectedContent', 'connectedMethod', 'connectedTendency', 'connectedSummary']) {
     const v = state[key];
     if (isRecord(v) && Array.isArray(v['connected'])) {
       for (const ref of v['connected']) {
@@ -111,6 +111,12 @@ async function runDetail(app: App, runId: string): Promise<Record<string, unknow
           formedCons.push(ref);
         }
       }
+    }
+  }
+  const reusedCons: ConsRef[] = [];
+  if (isRecord(state['connectedContent']) && Array.isArray(state['connectedContent']['reused'])) {
+    for (const ref of state['connectedContent']['reused']) {
+      if (isRef(ref)) reusedCons.push(ref);
     }
   }
   const markedNode = state['_currentNode'];
@@ -130,12 +136,18 @@ async function runDetail(app: App, runId: string): Promise<Record<string, unknow
     result: {
       inputCons: state['inputCons'] ?? null,
       actionResult: state['actionResult'] ?? null,
+      entityResolution: state['entityResolution'] ?? null,
+      contextAssociations: state['contextAssociations'] ?? null,
+      pendingResolution: state['pendingResolution'] ?? null,
+      summaryDraft: state['summaryDraft'] ?? null,
+      connectedSummary: state['connectedSummary'] ?? null,
       mainCase: state['mainCase'] ?? null,
       noCandidateCase: state['noCandidateCase'] ?? null,
       internalizeResult: state['internalizeResult'] ?? null,
     },
     usedDefaultFreedom: isRecord(state['methodSelection']) ? state['methodSelection']['usedDefaultFreedom'] === true : null,
     formedCons,
+    reusedCons,
     reusedMethods,
     steps: steps.map(stepView),
   };
@@ -259,6 +271,34 @@ async function route(app: App, req: IncomingMessage, res: ServerResponse): Promi
     const budget = isRecord(body['budget']) ? body['budget'] as Partial<RunBudget> : undefined;
     const run = await app.runFlow(entryFlowId, task, body['input'] ?? {}, budget);
     sendJson(res, 201, { runId: run.id });
+    return;
+  }
+  if (method === 'POST' && parts.length === 1 && parts[0] === 'summarize') {
+    const body = await readBody(req);
+    if (!isRecord(body)) {
+      throw Object.assign(new Error('body must be an object'), { code: 'schema_mismatch' });
+    }
+    const input: SummarizeTopicInput = {};
+    if (isRef(body['topicRef'])) input.topicRef = body['topicRef'];
+    if (typeof body['topicQuery'] === 'string') input.topicQuery = body['topicQuery'];
+    if (typeof body['task'] === 'string') input.task = body['task'];
+    if (isRecord(body['updateSummaryRef']) && typeof body['updateSummaryRef']['consId'] === 'string' && typeof body['updateSummaryRef']['expectedRevision'] === 'number') {
+      input.updateSummaryRef = {
+        consId: body['updateSummaryRef']['consId'],
+        expectedRevision: body['updateSummaryRef']['expectedRevision'],
+      };
+    }
+    const run = await app.summarizeTopic(input);
+    sendJson(res, 201, { runId: run.id, status: run.status });
+    return;
+  }
+  if (method === 'POST' && parts.length === 3 && parts[0] === 'runs' && parts[2] === 'resolve') {
+    const body = await readBody(req);
+    if (!isRecord(body) || !Array.isArray(body['decisions'])) {
+      throw Object.assign(new Error('decisions (array) is required'), { code: 'schema_mismatch' });
+    }
+    const run = await app.resumeResolution(parts[1] ?? '', body['decisions'] as ResolutionDecisionInput[]);
+    sendJson(res, 200, { runId: run.id, status: run.status });
     return;
   }
   if (method === 'GET' && parts.length === 2 && parts[0] === 'runs') {

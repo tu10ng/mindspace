@@ -215,6 +215,31 @@ const MIGRATIONS: Migration[] = [
 )`);
     },
   },
+  {
+    version: 5,
+    name: 'trusted_snapshots_and_edge_evidence',
+    apply: (db) => {
+      db.exec(`CREATE TABLE run_trusted_snapshots (
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  key TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, key)
+);
+
+CREATE TABLE cons_edge_evidence (
+  edge_id TEXT NOT NULL REFERENCES cons_edges(id),
+  evidence_cons_id TEXT NOT NULL REFERENCES cons(id),
+  evidence_revision INTEGER NOT NULL,
+  created_by_step_id TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (edge_id, evidence_cons_id, evidence_revision)
+);
+CREATE INDEX idx_cons_edge_evidence_edge ON cons_edge_evidence(edge_id);
+CREATE INDEX idx_cons_edges_triple ON cons_edges(from_id, from_revision, relation_cons_id, to_id, to_revision, status);`);
+    },
+  },
 ];
 
 export function openDb(path: string): StoreDb {

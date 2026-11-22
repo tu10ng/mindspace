@@ -1,14 +1,23 @@
 import type {
   ActionSpec, AvailableRefItem, AvailableReferences, Binding, ConsRef, ConsRevision,
-  ErrorCode, ExecutionEnvelope, FlowNode, FlowSpec, LlmAdapter,
-  LlmResponse, MethodSpec, Run, Step, TendencySpec, ValidationIssue,
+  EntityCandidate, EntityResolutionItem, ErrorCode, ExecutionEnvelope, FlowNode, FlowSpec, LlmAdapter,
+  LlmResponse, MethodSpec, Run, StatementCandidate, Step, TendencySpec, ValidationIssue,
 } from '../types.js';
 import type { ConsStoreApi } from '../store/api.js';
 import { validateSchema, validateSchemaDetailed, validateSchemaStructure } from '../schema.js';
 import { resolvePath } from './path.js';
 import { evaluateTransition, validateFlow } from './flow.js';
 import { buildPrompts } from '../llm/prompt.js';
-import { adaptInputForSchema, isContentActionCompatible } from '../primitives/index.js';
+import {
+  adaptInputForSchema,
+  isContentActionCompatible,
+  TRUSTED_SNAPSHOT_ENTITY_CONTEXT,
+  TRUSTED_SNAPSHOT_ENTITY_RESOLUTION,
+  TRUSTED_SNAPSHOT_SUMMARY_CONTEXT,
+  type TrustedEntityContextSnapshot,
+  type TrustedEntityResolutionSnapshot,
+  type TrustedSummaryContextSnapshot,
+} from '../primitives/index.js';
 import type { LlmAttemptLog } from './llm_log.js';
 import { PROMPT_TEMPLATE_VERSION } from './llm_log.js';
 
@@ -291,6 +300,55 @@ async function refsFromCandidateList(store: ConsStoreApi, raw: unknown): Promise
   return items;
 }
 
+function refKey(ref: ConsRef): string {
+  return `${ref.consId}@${String(ref.revision)}`;
+}
+
+function asEntityCandidateArray(value: unknown, allowedKeys: Set<string> | null): EntityCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const out: EntityCandidate[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || !isRef(item['ref'])) continue;
+    if (allowedKeys !== null && !allowedKeys.has(refKey(item['ref']))) continue;
+    out.push(item as unknown as EntityCandidate);
+  }
+  return out;
+}
+
+function asStatementCandidateArray(value: unknown, allowedKeys: Set<string> | null): StatementCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const out: StatementCandidate[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || !isRef(item['ref'])) continue;
+    if (allowedKeys !== null && !allowedKeys.has(refKey(item['ref']))) continue;
+    out.push(item as unknown as StatementCandidate);
+  }
+  return out;
+}
+
+async function resolveContextRefsForRun(
+  store: ConsStoreApi,
+  run: Run,
+  input: Record<string, unknown>,
+): Promise<{ objects: EntityCandidate[]; statements: StatementCandidate[] }> {
+  // Always intersect with server-trusted entity_context snapshot when present so
+  // tampered run.state entries cannot inject unauthorized references.
+  const snap = await store.getTrustedSnapshot<TrustedEntityContextSnapshot>(run.id, TRUSTED_SNAPSHOT_ENTITY_CONTEXT);
+  const allowedObjKeys = snap !== null ? new Set(snap.payload.objectRefs.map(refKey)) : null;
+  const allowedStmtKeys = snap !== null ? new Set(snap.payload.statementRefs.map(refKey)) : null;
+  const bundle = isRecord(run.state['contextBundle']) ? run.state['contextBundle'] : null;
+  const rawObjects = Array.isArray(input['availableObjects'])
+    ? input['availableObjects']
+    : (bundle !== null && Array.isArray(bundle['objects']) ? bundle['objects'] : []);
+  const rawStatements = Array.isArray(input['availableStatements'])
+    ? input['availableStatements']
+    : (bundle !== null && Array.isArray(bundle['statements']) ? bundle['statements'] : []);
+  return {
+    objects: asEntityCandidateArray(rawObjects, allowedObjKeys),
+    statements: asStatementCandidateArray(rawStatements, allowedStmtKeys),
+  };
+}
+
 async function buildAvailableReferences(
   store: ConsStoreApi,
   run: Run,
@@ -311,9 +369,9 @@ async function buildAvailableReferences(
   }));
 
   const isSelectAction = actionId === 'seed.select_action'
-    || (actionSpec.freedom.chooseWithinCandidates && actionId !== 'seed.select_method' && !candidates.some((c) => c.roles.includes('method')));
+    || (actionSpec.freedom.chooseWithinCandidates && actionId !== 'seed.select_method' && actionId !== 'seed.resolve_entities' && !candidates.some((c) => c.roles.includes('method')));
   const isSelectMethod = actionId === 'seed.select_method'
-    || (actionSpec.freedom.chooseWithinCandidates && candidates.some((c) => c.roles.includes('method')));
+    || (actionSpec.freedom.chooseWithinCandidates && actionId !== 'seed.resolve_entities' && candidates.some((c) => c.roles.includes('method')));
 
   if (isSelectAction) {
     refs.availableActions = candidates.map((c) => ({
@@ -335,6 +393,33 @@ async function buildAvailableReferences(
 
   if (hasArtifactsAndLinksSchema(actionSpec.outputSchema)) {
     refs.availableRelationTypes = relationTypeItems;
+    const ctxRefs = await resolveContextRefsForRun(store, run, input);
+    refs.availableObjects = ctxRefs.objects;
+    refs.availableStatements = ctxRefs.statements;
+  }
+
+  if (actionId === 'seed.resolve_entities') {
+    const ctxRefs = await resolveContextRefsForRun(store, run, input);
+    refs.availableObjects = ctxRefs.objects;
+    refs.availableStatements = ctxRefs.statements;
+    refs.availableTendencies = tendencyItems;
+  }
+
+  if (actionId === 'seed.associate_context') {
+    const ctxRefs = await resolveContextRefsForRun(store, run, input);
+    refs.availableObjects = ctxRefs.objects;
+    refs.availableStatements = ctxRefs.statements;
+    refs.availableRelationTypes = relationTypeItems;
+  }
+
+  if (actionId === 'seed.summarize_topic') {
+    const topic = isRecord(input['topic']) && isRef(input['topic']['ref'])
+      ? [input['topic'] as unknown as EntityCandidate]
+      : [];
+    const direct = asStatementCandidateArray(input['directStatements'], null);
+    const related = asStatementCandidateArray(input['relatedContextStatements'], null);
+    refs.availableObjects = topic;
+    refs.availableStatements = [...direct, ...related];
   }
 
   if (actionId === 'seed.extract_method') {
@@ -614,7 +699,7 @@ async function validateOutputIssues(
           });
         }
         if (content['spec'] !== undefined) {
-          if (kind === 'object' || kind === 'proposition' || kind === 'relation_type') {
+          if (kind === 'object' || kind === 'concept' || kind === 'proposition' || kind === 'relation_type') {
             issues.push({
               code: 'schema_mismatch',
               path: `$.artifacts[${String(i)}].content.spec`,
@@ -633,11 +718,9 @@ async function validateOutputIssues(
       }
     }
 
-    const availableRelTypes = envelope.availableReferences?.availableRelationTypes
-      ?? (envelope.allowedRelationTypes ?? []).map((consId) => ({ consId, revision: 1, title: consId, description: '' }));
+    const availableRelTypes = envelope.availableReferences?.availableRelationTypes ?? [];
     const allowedRelRefs = availableRelTypes.map((r) => ({ consId: r.consId, revision: r.revision }));
     const allowedRelKeySet = new Set(availableRelTypes.map((r) => `${r.consId}@${String(r.revision)}`));
-    const allowedRelIdSet = new Set(availableRelTypes.map((r) => r.consId));
     const allowedTempList = [...tempIds];
     const allowedDraftRelList = [...draftRelationTempIds];
 
@@ -740,21 +823,354 @@ async function validateOutputIssues(
             message: 'relation.kind 必须是 existing 或 draft。',
           });
         }
-      } else if (typeof link['relationConsId'] === 'string') {
-        if (!allowedRelIdSet.has(link['relationConsId'])) {
+      } else {
+        issues.push({
+          code: 'schema_mismatch',
+          path: `$.links[${String(i)}].relation`,
+          message: '每条边必须提供结构化的 relation 对象（禁止使用裸 relationConsId 字符串）。',
+        });
+      }
+    }
+    return issues;
+  }
+
+  if (envelope.action.ref.consId === 'seed.resolve_entities') {
+    const inputObj = isRecord(envelope.input) ? envelope.input : {};
+    const inputArtifacts = Array.isArray(inputObj['artifacts']) ? inputObj['artifacts'] : [];
+    // Only object and concept proposals participate in entity alignment; propositions & relation_types do not.
+    const expectedTempIds = new Set<string>();
+    for (const art of inputArtifacts) {
+      if (!isRecord(art) || !isNonEmptyString(art['tempId'])) continue;
+      const kind = art['kind'];
+      if (kind === 'object' || kind === 'concept') {
+        expectedTempIds.add(art['tempId']);
+      }
+    }
+    const allowedObjects = envelope.availableReferences?.availableObjects ?? [];
+    const allowedObjectRefs = allowedObjects.map((o) => o.ref);
+    const allowedObjectKeys = new Set(allowedObjects.map((o) => refKey(o.ref)));
+
+    const resolutions = Array.isArray(output['resolutions']) ? output['resolutions'] : [];
+    const seen = new Set<string>();
+    let hasUnresolved = false;
+
+    for (let i = 0; i < resolutions.length; i++) {
+      const item = resolutions[i];
+      if (!isRecord(item)) continue;
+      const tid = item['tempId'];
+      if (typeof tid !== 'string' || !expectedTempIds.has(tid)) {
+        issues.push({
+          code: 'invalid_reference',
+          path: `$.resolutions[${String(i)}].tempId`,
+          value: tid,
+          allowedValues: [...expectedTempIds],
+          message: 'tempId 必须是本批次中 kind 为 object 或 concept 的局部提案标识。',
+        });
+      } else if (seen.has(tid)) {
+        issues.push({
+          code: 'schema_mismatch',
+          path: `$.resolutions[${String(i)}].tempId`,
+          value: tid,
+          message: `tempId "${tid}" 在 resolutions 中重复出现。`,
+        });
+      } else {
+        seen.add(tid);
+      }
+
+      if (!isNonEmptyString(item['basis'])) {
+        issues.push({
+          code: 'schema_mismatch',
+          path: `$.resolutions[${String(i)}].basis`,
+          value: item['basis'],
+          message: 'basis 必须是非空审计说明字符串。',
+        });
+      }
+
+      const decision = item['decision'];
+      const existingRef = item['existingRef'];
+      const candRefs = item['candidateRefs'];
+
+      if (decision === 'reuse') {
+        if (!isRef(existingRef)) {
           issues.push({
-            code: 'unauthorized_effect',
-            path: `$.links[${String(i)}].relationConsId`,
-            value: link['relationConsId'],
-            allowedValues: [...allowedRelIdSet],
-            message: 'relationConsId 只能引用已提供的关系类型ID。',
+            code: 'schema_mismatch',
+            path: `$.resolutions[${String(i)}].existingRef`,
+            value: existingRef,
+            allowedValues: allowedObjectRefs,
+            message: 'decision 为 reuse 时必须提供有效的 existingRef ({ consId, revision })。',
+          });
+        } else if (!allowedObjectKeys.has(refKey(existingRef))) {
+          issues.push({
+            code: 'invalid_reference',
+            path: `$.resolutions[${String(i)}].existingRef`,
+            value: existingRef,
+            allowedValues: allowedObjectRefs,
+            message: allowedObjectRefs.length === 0
+              ? 'availableObjects 为空集 []，不允许复用任何已有对象ID。'
+              : 'existingRef 必须精确引用本次 availableObjects 中提供的 consId 与 revision。',
+          });
+        }
+      } else if (decision === 'create') {
+        if (existingRef !== undefined && existingRef !== null) {
+          issues.push({
+            code: 'schema_mismatch',
+            path: `$.resolutions[${String(i)}].existingRef`,
+            value: existingRef,
+            allowedValues: [null],
+            message: 'decision 为 create 时不得携带 existingRef。',
+          });
+        }
+      } else if (decision === 'unresolved') {
+        hasUnresolved = true;
+        if (existingRef !== undefined && existingRef !== null) {
+          issues.push({
+            code: 'schema_mismatch',
+            path: `$.resolutions[${String(i)}].existingRef`,
+            value: existingRef,
+            allowedValues: [null],
+            message: 'decision 为 unresolved 时不得猜测或填写 existingRef。',
+          });
+        }
+        if (Array.isArray(candRefs)) {
+          for (let j = 0; j < candRefs.length; j++) {
+            const cr = candRefs[j];
+            if (!isRef(cr) || !allowedObjectKeys.has(refKey(cr))) {
+              issues.push({
+                code: 'invalid_reference',
+                path: `$.resolutions[${String(i)}].candidateRefs[${String(j)}]`,
+                value: cr,
+                allowedValues: allowedObjectRefs,
+                message: 'candidateRefs 只能引用本次 availableObjects 中提供的候选对象。',
+              });
+            }
+          }
+        }
+      }
+    }
+
+    for (const expected of expectedTempIds) {
+      if (!seen.has(expected)) {
+        issues.push({
+          code: 'schema_mismatch',
+          path: '$.resolutions',
+          value: expected,
+          allowedValues: [...expectedTempIds],
+          message: `缺少局部对象 tempId "${expected}" 的辨认结果。`,
+        });
+      }
+    }
+
+    const status = output['status'];
+    if (hasUnresolved && status !== 'needs_resolution') {
+      issues.push({
+        code: 'schema_mismatch',
+        path: '$.status',
+        value: status,
+        allowedValues: ['needs_resolution'],
+        message: '存在 unresolved 决定时，顶层 status 必须为 "needs_resolution"。',
+      });
+    } else if (!hasUnresolved && status !== 'resolved') {
+      issues.push({
+        code: 'schema_mismatch',
+        path: '$.status',
+        value: status,
+        allowedValues: ['resolved'],
+        message: '全部对象均已决定为 reuse 或 create 时，顶层 status 必须为 "resolved"。',
+      });
+    }
+    return issues;
+  }
+
+  if (envelope.action.ref.consId === 'seed.associate_context') {
+    const inputObj = isRecord(envelope.input) ? envelope.input : {};
+    const inputArtifacts = Array.isArray(inputObj['artifacts']) ? inputObj['artifacts'] : [];
+    const batchTempIds = new Set<string>();
+    const draftRelTempIds = new Set<string>();
+    for (const art of inputArtifacts) {
+      if (!isRecord(art) || !isNonEmptyString(art['tempId'])) continue;
+      batchTempIds.add(art['tempId']);
+      if (art['kind'] === 'relation_type') {
+        draftRelTempIds.add(art['tempId']);
+      }
+    }
+
+    const availableObjects = envelope.availableReferences?.availableObjects ?? [];
+    const availableStatements = envelope.availableReferences?.availableStatements ?? [];
+    const availableRelTypes = envelope.availableReferences?.availableRelationTypes ?? [];
+    const allowedEndpointRefs = [...availableObjects.map((o) => o.ref), ...availableStatements.map((s) => s.ref)];
+    const allowedEndpointKeys = new Set(allowedEndpointRefs.map(refKey));
+    const allowedRelRefs = availableRelTypes.map((r) => ({ consId: r.consId, revision: r.revision }));
+    const allowedRelKeySet = new Set(availableRelTypes.map((r) => `${r.consId}@${String(r.revision)}`));
+
+    const allowedEvidenceRefs: ConsRef[] = [...allowedEndpointRefs];
+    const inputCons = isRecord(inputObj['input']) ? inputObj['input'] : null;
+    if (inputCons !== null && isRef(inputCons['consRef'])) {
+      allowedEvidenceRefs.unshift(inputCons['consRef']);
+    }
+    const allowedEvidenceKeys = new Set(allowedEvidenceRefs.map(refKey));
+
+    const checkEndpoint = (ep: unknown, path: string): void => {
+      if (!isRecord(ep)) {
+        issues.push({ code: 'schema_mismatch', path, value: ep, message: '端点必须是显式联合对象（kind 为 existing 或 draft）。' });
+        return;
+      }
+      const kind = ep['kind'];
+      if (kind === 'draft') {
+        if (ep['ref'] !== undefined) {
+          issues.push({ code: 'schema_mismatch', path: `${path}.ref`, value: ep['ref'], message: 'kind 为 draft 时不得提供 ref。' });
+        }
+        const tid = ep['tempId'];
+        if (typeof tid !== 'string' || !batchTempIds.has(tid)) {
+          issues.push({
+            code: 'invalid_reference',
+            path: `${path}.tempId`,
+            value: tid,
+            allowedValues: [...batchTempIds],
+            message: 'draft 端点 tempId 必须属于当前批次 artifacts。',
+          });
+        }
+      } else if (kind === 'existing') {
+        if (ep['tempId'] !== undefined) {
+          issues.push({ code: 'schema_mismatch', path: `${path}.tempId`, value: ep['tempId'], message: 'kind 为 existing 时不得提供 tempId。' });
+        }
+        const ref = ep['ref'];
+        if (!isRef(ref)) {
+          issues.push({
+            code: 'schema_mismatch',
+            path: `${path}.ref`,
+            value: ref,
+            allowedValues: allowedEndpointRefs,
+            message: 'existing 端点必须提供有效的 ref ({ consId, revision })。',
+          });
+        } else if (!allowedEndpointKeys.has(refKey(ref))) {
+          issues.push({
+            code: 'invalid_reference',
+            path: `${path}.ref`,
+            value: ref,
+            allowedValues: allowedEndpointRefs,
+            message: allowedEndpointRefs.length === 0
+              ? '当前无可用已有对象/命题上下文，不得引用任何已有端点。'
+              : 'existing 端点必须来自本次授权的 availableObjects 或 availableStatements。',
           });
         }
       } else {
         issues.push({
           code: 'schema_mismatch',
-          path: `$.links[${String(i)}].relation`,
-          message: '每条边必须提供 relation 对象。',
+          path: `${path}.kind`,
+          value: kind,
+          allowedValues: ['existing', 'draft'],
+          message: '端点 kind 必须是 existing 或 draft。',
+        });
+      }
+    };
+
+    const associations = Array.isArray(output['associations']) ? output['associations'] : [];
+    for (let i = 0; i < associations.length; i++) {
+      const assoc = associations[i];
+      if (!isRecord(assoc)) continue;
+      checkEndpoint(assoc['from'], `$.associations[${String(i)}].from`);
+      checkEndpoint(assoc['to'], `$.associations[${String(i)}].to`);
+
+      const rel = assoc['relation'];
+      if (!isRecord(rel)) {
+        issues.push({ code: 'schema_mismatch', path: `$.associations[${String(i)}].relation`, message: '缺少 relation 对象。' });
+      } else if (rel['kind'] === 'existing') {
+        if (rel['tempId'] !== undefined) {
+          issues.push({ code: 'schema_mismatch', path: `$.associations[${String(i)}].relation.tempId`, message: 'existing 关系不得提供 tempId。' });
+        }
+        if (!isRef(rel['ref']) || !allowedRelKeySet.has(refKey(rel['ref']))) {
+          issues.push({
+            code: 'invalid_reference',
+            path: `$.associations[${String(i)}].relation.ref`,
+            value: rel['ref'],
+            allowedValues: allowedRelRefs,
+            message: '已有关系类型必须精确引用本次 availableRelationTypes 中的 consId 与 revision。',
+          });
+        }
+      } else if (rel['kind'] === 'draft') {
+        if (envelope.allowRelationTypeDrafts !== true) {
+          issues.push({
+            code: 'unauthorized_effect',
+            path: `$.associations[${String(i)}].relation.kind`,
+            value: rel['kind'],
+            allowedValues: ['existing'],
+            message: '当前步骤未授权引用新关系类型草案。',
+          });
+        } else if (typeof rel['tempId'] !== 'string' || !draftRelTempIds.has(rel['tempId'])) {
+          issues.push({
+            code: 'invalid_reference',
+            path: `$.associations[${String(i)}].relation.tempId`,
+            value: rel['tempId'],
+            allowedValues: [...draftRelTempIds],
+            message: 'draft 关系必须引用本批次 kind 为 relation_type 的 tempId。',
+          });
+        }
+      }
+
+      const evRefs = assoc['evidenceRefs'];
+      if (!Array.isArray(evRefs) || evRefs.length === 0) {
+        issues.push({
+          code: 'schema_mismatch',
+          path: `$.associations[${String(i)}].evidenceRefs`,
+          value: evRefs,
+          allowedValues: allowedEvidenceRefs,
+          message: '每条关联必须提供至少一条来源引用 evidenceRefs。',
+        });
+      } else {
+        for (let j = 0; j < evRefs.length; j++) {
+          const ev = evRefs[j];
+          if (!isRef(ev) || !allowedEvidenceKeys.has(refKey(ev))) {
+            issues.push({
+              code: 'invalid_reference',
+              path: `$.associations[${String(i)}].evidenceRefs[${String(j)}]`,
+              value: ev,
+              allowedValues: allowedEvidenceRefs,
+              message: 'evidenceRefs 必须精确引用本次输入或已提供上下文中的 consId 与 revision。',
+            });
+          }
+        }
+      }
+
+      if (!isNonEmptyString(assoc['basis'])) {
+        issues.push({
+          code: 'schema_mismatch',
+          path: `$.associations[${String(i)}].basis`,
+          value: assoc['basis'],
+          message: 'association.basis 必须是非空字符串。',
+        });
+      }
+    }
+    return issues;
+  }
+
+  if (envelope.action.ref.consId === 'seed.summarize_topic') {
+    if (!isNonEmptyString(output['title'])) {
+      issues.push({ code: 'schema_mismatch', path: '$.title', value: output['title'], message: '汇总 title 必须是非空字符串。' });
+    }
+    if (!isNonEmptyString(output['body'])) {
+      issues.push({ code: 'schema_mismatch', path: '$.body', value: output['body'], message: '汇总 body 必须是非空字符串。' });
+    }
+    const snap = await store.getTrustedSnapshot<TrustedSummaryContextSnapshot>(
+      envelope.runId,
+      TRUSTED_SNAPSHOT_SUMMARY_CONTEXT,
+    );
+    const inputObj = isRecord(envelope.input) ? envelope.input : {};
+    const allowedRefs = snap !== null
+      ? snap.payload.allowedSourceRefs
+      : asRefArray(inputObj['allowedSourceRefs']);
+    const allowedKeys = new Set(allowedRefs.map(refKey));
+    const sourceRefs = Array.isArray(output['sourceRefs']) ? output['sourceRefs'] : [];
+    for (let i = 0; i < sourceRefs.length; i++) {
+      const sref = sourceRefs[i];
+      if (!isRef(sref) || !allowedKeys.has(refKey(sref))) {
+        issues.push({
+          code: 'invalid_reference',
+          path: `$.sourceRefs[${String(i)}]`,
+          value: sref,
+          allowedValues: allowedRefs,
+          message: allowedRefs.length === 0
+            ? 'allowedSourceRefs 为空集 []，不得引用任何来源ID。'
+            : 'sourceRefs 只能引用本次上下文提供的 allowedSourceRefs。',
         });
       }
     }
@@ -832,13 +1248,15 @@ async function validateOutputIssues(
           allowedValues: allowedActionIds,
           message: 'method.actionId 必须是非空字符串。',
         });
-      } else if (allowedActionIds.length > 0 && !allowedActionIds.includes(actionId)) {
+      } else if (!allowedActionIds.includes(actionId)) {
         issues.push({
           code: 'invalid_reference',
           path: '$.method.actionId',
           value: actionId,
           allowedValues: allowedActionIds,
-          message: 'method.actionId 必须是本次实际执行并在 availableActions 中提供的动作ID。',
+          message: allowedActionIds.length === 0
+            ? 'availableActions 为空集 []，不允许填写任何 actionId。'
+            : 'method.actionId 必须是本次实际执行并在 availableActions 中提供的动作ID。',
         });
       }
     } else if (status === 'none' && method !== undefined && method !== null) {
@@ -1020,6 +1438,17 @@ type ParsedCheck =
   | { ok: true; value: unknown }
   | { ok: false; code: ErrorCode; issues: ValidationIssue[] };
 
+/**
+ * Strip a single wrapping Markdown code fence (```json ... ``` or ``` ... ```)
+ * if and only if the entire trimmed response is a single fenced block.
+ * Does not attempt heuristic extraction from prose.
+ */
+function stripSingleJsonFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+  return match !== null && match[1] !== undefined ? match[1].trim() : trimmed;
+}
+
 async function checkParsed(
   store: ConsStoreApi,
   envelope: ExecutionEnvelope,
@@ -1029,7 +1458,7 @@ async function checkParsed(
   const truncated = isTruncatedStopReason(stopReason);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(stripSingleJsonFence(text));
   } catch {
     if (truncated) {
       return {
@@ -1361,6 +1790,55 @@ function authorizeSelection(output: unknown, authorization: Omit<AuthorizationRe
   return output;
 }
 
+/**
+ * Build the server-trusted entity resolution snapshot and derived create-only
+ * artifact list (so prepare_connections never touches reused existing objects).
+ */
+export function buildEntityResolutionArtifacts(
+  inputArtifacts: unknown[],
+  resolutions: EntityResolutionItem[],
+  batchStepId: string,
+  candidateSnapshotStepId: string | null,
+  confirmedByHuman = false,
+): {
+  snapshot: TrustedEntityResolutionSnapshot;
+  createArtifacts: unknown[];
+  reusedTempIds: string[];
+} {
+  const tempIdToExistingRef: Record<string, ConsRef> = {};
+  const createTempIds: string[] = [];
+  const unresolvedTempIds: string[] = [];
+  const reusedSet = new Set<string>();
+
+  for (const r of resolutions) {
+    if (r.decision === 'reuse' && isRef(r.existingRef)) {
+      tempIdToExistingRef[r.tempId] = r.existingRef;
+      reusedSet.add(r.tempId);
+    } else if (r.decision === 'create') {
+      createTempIds.push(r.tempId);
+    } else if (r.decision === 'unresolved') {
+      unresolvedTempIds.push(r.tempId);
+    }
+  }
+
+  const createArtifacts = inputArtifacts.filter((art) => {
+    if (!isRecord(art) || typeof art['tempId'] !== 'string') return true;
+    return !reusedSet.has(art['tempId']);
+  });
+
+  const snapshot: TrustedEntityResolutionSnapshot = {
+    batchStepId,
+    candidateSnapshotStepId,
+    resolutions,
+    tempIdToExistingRef,
+    createTempIds,
+    unresolvedTempIds,
+    ...(confirmedByHuman ? { confirmedByHuman: true } : {}),
+  };
+
+  return { snapshot, createArtifacts, reusedTempIds: [...reusedSet] };
+}
+
 export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> {
   const run = await deps.store.getRun(runId);
   if (run === null) {
@@ -1374,7 +1852,7 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       task: run.task,
     }, run.id, null);
   }
-  if (run.status === 'queued') {
+  if (run.status === 'queued' || run.status === 'needs_resolution') {
     run.status = 'running';
     await deps.store.updateRun(run.id, { status: 'running' });
   }
@@ -1400,6 +1878,9 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       return failRun(deps, run, null, 'config_error', `node "${nodeId}" not found`);
     }
     if (node.terminal === true) {
+      if (node.pauseStatus === 'needs_resolution') {
+        return pauseRunForResolution(deps, run, nodeId);
+      }
       return finishRun(deps, run);
     }
     const existing = await deps.store.getStep(run.id, nodeId);
@@ -1580,7 +2061,29 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
     }
     const committed: Step = { ...step, status: 'succeeded', output };
     const authorization = buildAuthorization(output, candidates);
-    const committedOutput = authorizeSelection(output, authorization);
+    let committedOutput = authorizeSelection(output, authorization);
+    let resolutionSnapshotToStore: TrustedEntityResolutionSnapshot | null = null;
+    if (actionRef.consId === 'seed.resolve_entities' && isRecord(output) && Array.isArray(output['resolutions'])) {
+      const inputArtifacts = isRecord(input) && Array.isArray(input['artifacts']) ? input['artifacts'] : [];
+      const ctxSnap = await deps.store.getTrustedSnapshot<TrustedEntityContextSnapshot>(
+        run.id,
+        TRUSTED_SNAPSHOT_ENTITY_CONTEXT,
+      );
+      const execSteps = await deps.store.listSteps(run.id);
+      const execActionStep = execSteps.find((s) => s.nodeId === 'execute_action');
+      const derived = buildEntityResolutionArtifacts(
+        inputArtifacts,
+        output['resolutions'] as EntityResolutionItem[],
+        execActionStep?.id ?? step.id,
+        ctxSnap?.stepId ?? null,
+      );
+      resolutionSnapshotToStore = derived.snapshot;
+      committedOutput = {
+        ...output,
+        createArtifacts: derived.createArtifacts,
+        reusedTempIds: derived.reusedTempIds,
+      };
+    }
     const committedStep: Step = { ...committed, output: committedOutput };
     const nextState: Record<string, unknown> = { ...run.state, [node.outputKey]: committedOutput, [STATE_KEY_CURRENT_NODE]: transition.next };
     const selectionLike = isRecord(output) && (output['status'] === 'selected' || output['status'] === 'no_candidate');
@@ -1600,6 +2103,26 @@ export async function executeRun(deps: EngineDeps, runId: string): Promise<Run> 
       await deps.store.updateRun(run.id, { state: nextState, counters: run.counters });
       if (authorization !== null) {
         await deps.store.putRunAuthorization(run.id, node.outputKey, { stepId: step.id, ...authorization });
+      }
+      if (resolutionSnapshotToStore !== null) {
+        await deps.store.putTrustedSnapshot(run.id, TRUSTED_SNAPSHOT_ENTITY_RESOLUTION, step.id, resolutionSnapshotToStore);
+        await deps.store.appendEvent('entity_resolution_made', {
+          stepId: step.id,
+          nodeId,
+          candidateCount: envelope.availableReferences?.availableObjects?.length ?? 0,
+          resolutions: resolutionSnapshotToStore.resolutions,
+          reusedCount: Object.keys(resolutionSnapshotToStore.tempIdToExistingRef).length,
+          createdCount: resolutionSnapshotToStore.createTempIds.length,
+          unresolvedCount: resolutionSnapshotToStore.unresolvedTempIds.length,
+        }, run.id, step.id);
+      }
+      if (actionRef.consId === 'seed.associate_context' && isRecord(output) && Array.isArray(output['associations'])) {
+        await deps.store.appendEvent('associations_proposed', {
+          stepId: step.id,
+          nodeId,
+          count: output['associations'].length,
+          associations: output['associations'],
+        }, run.id, step.id);
       }
       if (selectionLike) {
         const committedRecord = isRecord(committedOutput) ? committedOutput : {};
@@ -1696,6 +2219,40 @@ async function exhaustBudget(
       budget: run.budget,
     }, run.id, info.step !== undefined ? info.step.id : null);
   });
+  return run;
+}
+
+async function pauseRunForResolution(deps: EngineDeps, run: Run, nodeId: string): Promise<Run> {
+  run.status = 'needs_resolution';
+  const entityResolution = isRecord(run.state['entityResolution']) ? run.state['entityResolution'] : null;
+  const topicContext = isRecord(run.state['topicContext']) ? run.state['topicContext'] : null;
+  const pendingPayload = entityResolution !== null
+    ? {
+        kind: 'entity_resolution',
+        resolutions: Array.isArray(entityResolution['resolutions']) ? entityResolution['resolutions'] : [],
+        availableObjects: isRecord(run.state['contextBundle']) && Array.isArray(run.state['contextBundle']['objects'])
+          ? run.state['contextBundle']['objects']
+          : [],
+      }
+    : {
+        kind: 'topic_disambiguation',
+        ambiguousTopics: topicContext !== null && Array.isArray(topicContext['ambiguousTopics'])
+          ? topicContext['ambiguousTopics']
+          : [],
+      };
+  const nextState: Record<string, unknown> = {
+    ...run.state,
+    pendingResolution: pendingPayload,
+    [STATE_KEY_CURRENT_NODE]: nodeId,
+  };
+  await deps.store.updateRun(run.id, { status: 'needs_resolution', state: nextState });
+  await deps.store.appendEvent('run_paused_for_resolution', {
+    runId: run.id,
+    nodeId,
+    status: 'needs_resolution',
+    pending: pendingPayload,
+  }, run.id, null);
+  run.state = nextState;
   return run;
 }
 

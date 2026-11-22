@@ -17,8 +17,8 @@ describe('form primitive', () => {
   it('creates draft cons with permanent ids and returns the tempId mapping', async () => {
     const ctx = makeCtx(store, {
       candidates: [
-        { tempId: 'a1', kind: 'object', content: { title: '草原', origin: 'llm' } },
-        { tempId: 'a2', kind: 'proposition', content: { title: '草很高', origin: 'llm' } },
+        { tempId: 'a1', kind: 'object', content: { title: '草原', body: '一片广阔的草原。' } },
+        { tempId: 'a2', kind: 'proposition', content: { title: '草很高', body: '草原上的草长势很高。' } },
       ],
     });
     const out = (await createPrimitives()['form']?.run(ctx, ctx.step.id)) as {
@@ -35,7 +35,7 @@ describe('form primitive', () => {
 
   it('drafts are not retrievable', async () => {
     const ctx = makeCtx(store, {
-      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '独一无二的草本书对象', origin: 'llm' } }],
+      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '独一无二的草本书对象', body: '未激活草稿对象正文。' } }],
     });
     const out = (await createPrimitives()['form']?.run(ctx, ctx.step.id)) as {
       formed: Array<{ consRef: { consId: string } }>;
@@ -82,7 +82,7 @@ describe('form primitive', () => {
 
   it('records source=llm for llm products even when the content claims origin execution (§3.1)', async () => {
     const ctx = makeCtx(store, {
-      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '执行来源产物', origin: 'execution' } }],
+      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '执行来源产物', body: '执行来源产物正文。', origin: 'execution' } }],
     });
     const out = (await createPrimitives()['form']?.run(ctx, ctx.step.id)) as {
       formed: Array<{ consRef: { consId: string } }>;

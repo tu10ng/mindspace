@@ -16,6 +16,7 @@ interface Candidate {
   roles: ConsRole[];
   channel: SearchResultItem['channel'];
   rank: number;
+  provenanceSource: string;
 }
 
 const CHANNEL_PRIORITY: Record<SearchResultItem['channel'], number> = {
@@ -50,7 +51,7 @@ function rolesOverlap(consRoles: ConsRole[], filter: Set<ConsRole> | null): bool
 function currentRevisionRow(db: StoreDb['db'], consId: string): Row | undefined {
   return db
     .prepare(
-      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
+      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json, r.provenance_json
        FROM cons c
        JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.id = ?`,
@@ -62,6 +63,16 @@ function parseRoles(rolesJson: unknown): ConsRole[] {
   return JSON.parse(rolesJson as string) as ConsRole[];
 }
 
+function parseProvenanceSource(provenanceJson: unknown): string {
+  if (typeof provenanceJson !== 'string') return '';
+  try {
+    const parsed = JSON.parse(provenanceJson) as { source?: unknown };
+    return typeof parsed?.source === 'string' ? parsed.source : '';
+  } catch {
+    return '';
+  }
+}
+
 function toCandidate(row: Row, channel: Candidate['channel'], rank: number): Candidate | null {
   if (row.status !== 'active') return null;
   return {
@@ -70,6 +81,7 @@ function toCandidate(row: Row, channel: Candidate['channel'], rank: number): Can
     roles: parseRoles(row.roles_json),
     channel,
     rank,
+    provenanceSource: parseProvenanceSource(row.provenance_json),
   };
 }
 
@@ -82,7 +94,7 @@ function idChannel(ctx: StoreDb, raw: string): Candidate[] {
 function exactChannel(ctx: StoreDb, norm: string, column: 'aliases_json' | 'search_terms_json'): Candidate[] {
   const rows = ctx.db
     .prepare(
-      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
+      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json, r.provenance_json
        FROM cons c
        JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active'
@@ -97,7 +109,7 @@ function exactChannel(ctx: StoreDb, norm: string, column: 'aliases_json' | 'sear
 function titleChannel(ctx: StoreDb, norm: string): Candidate[] {
   const rows = ctx.db
     .prepare(
-      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json
+      `SELECT c.id AS cons_id, c.status, r.title, r.roles_json, r.provenance_json
        FROM cons c
        JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
        WHERE c.status = 'active' AND lower(r.title) = ?
@@ -163,12 +175,18 @@ function likeChannel(ctx: StoreDb, norm: string): Candidate[] {
       roles: parseRoles(cur.roles_json),
       channel: 'fts',
       rank: 0,
+      provenanceSource: parseProvenanceSource(cur.provenance_json),
     });
   }
   return candidates;
 }
 
-function assocChannel(ctx: StoreDb, seedIds: string[], filter: Set<ConsRole> | null): Candidate[] {
+function assocChannel(
+  ctx: StoreDb,
+  seedIds: string[],
+  filter: Set<ConsRole> | null,
+  excludeInputProvenance: boolean,
+): Candidate[] {
   if (seedIds.length === 0) return [];
   const placeholders = seedIds.map(() => '?').join(',');
   const params: SQLInputValue[] = [...seedIds, ...seedIds];
@@ -191,10 +209,19 @@ function assocChannel(ctx: StoreDb, seedIds: string[], filter: Set<ConsRole> | n
     if (cur === undefined || cur.status !== 'active') continue;
     const cand = toCandidate({ ...cur, cons_id: other }, 'assoc', 0);
     if (cand === null || !rolesOverlap(cand.roles, filter)) continue;
+    if (excludeInputProvenance && cand.provenanceSource === 'input') continue;
     out.push(cand);
     if (out.length >= ASSOC_LIMIT) break;
   }
   return out.sort((a, b) => (a.consId < b.consId ? -1 : a.consId > b.consId ? 1 : 0));
+}
+
+function splitQueryTokens(rawText: string): string[] {
+  const parts = rawText
+    .split(/[\s,，、。；;：:（）()【】[\]「」《》“”"']+/)
+    .map((p) => normalizeQueryText(p))
+    .filter((p) => p.length >= 2);
+  return [...new Set(parts)].slice(0, 6);
 }
 
 export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
@@ -203,6 +230,7 @@ export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
   const notes: string[] = [];
   if (norm === '') return { items: [], notes };
   const filter = query.roles !== undefined && query.roles.length > 0 ? new Set(query.roles) : null;
+  const excludeInput = query.excludeInputProvenance === true;
 
   const collected: Candidate[] = [];
   const seen = new Set<string>();
@@ -211,27 +239,40 @@ export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
     for (const cand of candidates) {
       if (seen.has(cand.consId)) continue;
       if (!rolesOverlap(cand.roles, filter)) continue;
+      if (excludeInput && cand.provenanceSource === 'input') continue;
       seen.add(cand.consId);
       collected.push(cand);
     }
   };
 
-  push(idChannel(ctx, query.text.trim()));
-  push(titleChannel(ctx, norm));
-  push(exactChannel(ctx, norm, 'aliases_json'));
-  push(exactChannel(ctx, norm, 'search_terms_json'));
+  const runTerm = (rawTerm: string, normTerm: string): void => {
+    push(idChannel(ctx, rawTerm));
+    push(titleChannel(ctx, normTerm));
+    push(exactChannel(ctx, normTerm, 'aliases_json'));
+    push(exactChannel(ctx, normTerm, 'search_terms_json'));
 
-  if (norm.length >= 3) {
-    const { candidates, note } = ftsChannel(ctx, norm);
-    if (note !== null) notes.push(note);
-    if (candidates.length > 0 || ctx.fts) {
-      push(candidates);
+    if (normTerm.length >= 3) {
+      const { candidates, note } = ftsChannel(ctx, normTerm);
+      if (note !== null) notes.push(note);
+      if (candidates.length > 0 || ctx.fts) {
+        push(candidates);
+      } else {
+        push(likeChannel(ctx, normTerm));
+      }
     } else {
-      push(likeChannel(ctx, norm));
+      push(likeChannel(ctx, normTerm));
+      if (!notes.includes('short_query_used_exact_and_like_channels')) {
+        notes.push('short_query_used_exact_and_like_channels');
+      }
     }
-  } else {
-    push(likeChannel(ctx, norm));
-    notes.push('short_query_used_exact_and_like_channels');
+  };
+
+  runTerm(query.text.trim(), norm);
+  const tokens = splitQueryTokens(query.text);
+  for (const tok of tokens) {
+    if (tok !== norm) {
+      runTerm(tok, tok);
+    }
   }
 
   const direct = collected
@@ -246,7 +287,7 @@ export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
     .slice(0, limit);
 
   const directIds = direct.map((c) => c.consId);
-  const assoc = assocChannel(ctx, directIds, filter).slice(0, ASSOC_LIMIT);
+  const assoc = assocChannel(ctx, directIds, filter, excludeInput).slice(0, ASSOC_LIMIT);
 
   const items: SearchResultItem[] = [...direct, ...assoc].map((c) => ({
     ref: { consId: c.consId, revision: 1 },
@@ -270,9 +311,60 @@ export function searchCons(ctx: StoreDb, query: SearchQuery): SearchResponse {
   return { items, notes };
 }
 
+/**
+ * Pure text mention scan: find active cons whose title or alias (length >= 2)
+ * appears verbatim inside `text`. Used as an additional deterministic lexical
+ * recall channel without any vector store or hidden identity resolution.
+ */
+export function findMentionedConsImpl(
+  ctx: StoreDb,
+  text: string,
+  roles: ConsRole[],
+  opts?: { excludeInputProvenance?: boolean; limit?: number },
+): SearchResultItem[] {
+  const lowered = text.trim().toLowerCase();
+  if (lowered.length < 2) return [];
+  const limit = opts?.limit ?? DEFAULT_LIMIT;
+  const filter = roles.length > 0 ? new Set(roles) : null;
+  const excludeInput = opts?.excludeInputProvenance === true;
+  const rows = ctx.db
+    .prepare(
+      `SELECT c.id AS cons_id, c.active_revision, c.status, r.title, r.roles_json, r.provenance_json
+       FROM cons c
+       JOIN cons_revisions r ON r.cons_id = c.id AND r.revision = c.active_revision
+       WHERE c.status = 'active'
+         AND (
+           (length(trim(r.title)) >= 2 AND instr(?, lower(trim(r.title))) > 0)
+           OR EXISTS (
+             SELECT 1 FROM json_each(r.aliases_json) e
+             WHERE length(trim(e.value)) >= 2 AND instr(?, lower(trim(e.value))) > 0
+           )
+         )
+       ORDER BY length(r.title) DESC, c.id ASC
+       LIMIT ?`,
+    )
+    .all(lowered, lowered, Math.max(limit * 3, CHANNEL_FETCH_LIMIT)) as Row[];
+  const out: SearchResultItem[] = [];
+  for (const row of rows) {
+    const consRoles = parseRoles(row.roles_json);
+    if (!rolesOverlap(consRoles, filter)) continue;
+    if (excludeInput && parseProvenanceSource(row.provenance_json) === 'input') continue;
+    out.push({
+      ref: { consId: row.cons_id as string, revision: row.active_revision as number },
+      title: row.title as string,
+      roles: consRoles,
+      score: CHANNEL_SCORE.name,
+      channel: 'name',
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 export function searchByRoleImpl(ctx: StoreDb, query: SearchQuery, roles: ConsRole[]): SearchResponse {
   const merged: SearchQuery = { text: query.text };
   if (query.limit !== undefined) merged.limit = query.limit;
+  if (query.excludeInputProvenance !== undefined) merged.excludeInputProvenance = query.excludeInputProvenance;
   const combined = [...(query.roles ?? []), ...roles];
   if (combined.length > 0) merged.roles = combined;
   return searchCons(ctx, merged);

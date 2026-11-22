@@ -98,6 +98,27 @@ export function createRoutes({ service, assetsRoot, logger, rootCtx, connection 
     },
   })
 
+  const resolve = verbs('/resolve', {
+    POST: async (request) => {
+      const body = await readJson(request)
+      if (typeof body.runId !== 'string' || !Array.isArray(body.decisions)) {
+        const err = new Error('需要提供 runId 和 decisions 数组')
+        err.code = 'invalid-request'
+        throw err
+      }
+      const run = await service.resumeResolution(body.runId, body.decisions)
+      return { ok: true, run }
+    },
+  })
+
+  const summarize = verbs('/summarize', {
+    POST: async (request) => {
+      const body = await readJson(request)
+      const run = await service.summarizeTopic(body)
+      return { ok: true, run }
+    },
+  })
+
   const layout = verbs('/layout', {
     POST: async (request) => {
       const body = await readJson(request)
@@ -200,7 +221,7 @@ export function createRoutes({ service, assetsRoot, logger, rootCtx, connection 
     },
   }
 
-  return [state, ingest, layout, models, stream, assets]
+  return [state, ingest, resolve, summarize, layout, models, stream, assets]
 }
 
 function statusOf(code) {

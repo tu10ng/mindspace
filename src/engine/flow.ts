@@ -70,6 +70,14 @@ export function validateFlow(spec: FlowSpec): string[] {
     if (node.terminal === true && (node.next !== undefined || node.transitions !== undefined)) {
       errors.push(`node "${id}": terminal node must not declare next or transitions`);
     }
+    if (node.pauseStatus !== undefined) {
+      if (node.terminal !== true) {
+        errors.push(`node "${id}": pauseStatus is only allowed on terminal nodes`);
+      }
+      if (node.pauseStatus !== 'needs_resolution') {
+        errors.push(`node "${id}": unsupported pauseStatus "${String(node.pauseStatus)}"`);
+      }
+    }
   }
   if (typeof entry === 'string' && entry in nodes) {
     const color = new Map<string, 0 | 1 | 2>();

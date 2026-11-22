@@ -16,7 +16,7 @@ afterEach(() => {
 describe('F04 primitive replay after effect commit without checkpoint', () => {
   it('form replay with the same step returns the same permanent ids and creates no new cons', async () => {
     const ctx = makeCtx(store, {
-      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '幂等重放对象', origin: 'llm' } }],
+      candidates: [{ tempId: 'a1', kind: 'object', content: { title: '幂等重放对象', body: '幂等重放对象正文。' } }],
     });
     const first = (await createPrimitives()['form']?.run(ctx, ctx.step.id)) as {
       formed: Array<{ tempId: string; consRef: { consId: string; revision: number } }>;

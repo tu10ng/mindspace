@@ -27,13 +27,14 @@ export interface SeedCons {
   methodOf?: string;
 }
 
-export const PRIMITIVE_KEYS = ['receive', 'search', 'form', 'connect', 'record', 'revise'] as const;
+export const PRIMITIVE_KEYS = ['receive', 'search', 'form', 'connect', 'materialize_and_connect', 'record', 'revise'] as const;
 
 type Freedom = ActionSpec['freedom'];
 
 const F_NONE: Freedom = { chooseWithinCandidates: false, fillExecutionDetails: false, proposeNewDefinitions: false };
 const F_FILL: Freedom = { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false };
 const F_CHOOSE: Freedom = { chooseWithinCandidates: true, fillExecutionDetails: false, proposeNewDefinitions: false };
+const F_CHOOSE_FILL: Freedom = { chooseWithinCandidates: true, fillExecutionDetails: true, proposeNewDefinitions: false };
 const F_PROPOSE: Freedom = { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: true };
 
 function schema(properties: Record<string, unknown>, required: string[]): object {
@@ -90,12 +91,12 @@ const selectionOutput: object = schema(
 
 const artifactKindEnum: object = {
   type: 'string',
-  enum: ['object', 'proposition', 'relation_type', 'relation', 'method', 'tendency', 'action'],
+  enum: ['object', 'concept', 'proposition', 'relation_type', 'method', 'tendency', 'action'],
 };
 
 const contentArtifactKindEnum: object = {
   type: 'string',
-  enum: ['object', 'proposition', 'relation_type'],
+  enum: ['object', 'concept', 'proposition', 'relation_type'],
 };
 
 const artifactContentSchema: object = {
@@ -137,6 +138,18 @@ const relationTargetSchema: object = {
   additionalProperties: false,
 };
 
+/** Explicit union endpoint schema for P1 cross-input associations (no bare string guessing). */
+const explicitEndpointSchema: object = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: ['existing', 'draft'] },
+    ref: refSchema,
+    tempId: { type: 'string' },
+  },
+  required: ['kind'],
+  additionalProperties: false,
+};
+
 const linkItemSchema: object = schema(
   {
     fromTempId: { type: 'string' },
@@ -145,6 +158,60 @@ const linkItemSchema: object = schema(
   },
   ['fromTempId', 'relation', 'toTempId'],
 );
+
+const associationItemSchema: object = schema(
+  {
+    from: explicitEndpointSchema,
+    relation: relationTargetSchema,
+    to: explicitEndpointSchema,
+    evidenceRefs: { type: 'array', items: refSchema },
+    basis: { type: 'string' },
+  },
+  ['from', 'relation', 'to', 'evidenceRefs', 'basis'],
+);
+
+const entityResolutionItemSchema: object = {
+  type: 'object',
+  properties: {
+    tempId: { type: 'string' },
+    decision: { type: 'string', enum: ['reuse', 'create', 'unresolved'] },
+    existingRef: nullableRefSchema,
+    candidateRefs: { type: 'array', items: refSchema },
+    basis: { type: 'string' },
+  },
+  required: ['tempId', 'decision', 'basis'],
+  additionalProperties: false,
+};
+
+const entityResolutionOutputSchema: object = schema(
+  {
+    status: { type: 'string', enum: ['resolved', 'needs_resolution'] },
+    resolutions: { type: 'array', items: entityResolutionItemSchema },
+  },
+  ['status', 'resolutions'],
+);
+
+const associateContextOutputSchema: object = schema(
+  {
+    associations: { type: 'array', items: associationItemSchema },
+  },
+  ['associations'],
+);
+
+const summarizeTopicOutputSchema: object = {
+  type: 'object',
+  properties: {
+    title: { type: 'string' },
+    body: { type: 'string' },
+    sourceRefs: { type: 'array', items: refSchema },
+    coverage: { type: 'array', items: { type: 'string' } },
+    openQuestions: { type: 'array', items: { type: 'string' } },
+    aliases: { type: 'array', items: { type: 'string' } },
+    searchTerms: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['title', 'body', 'sourceRefs', 'coverage', 'openQuestions'],
+  additionalProperties: false,
+};
 
 const formCandidateItem: object = schema(
   { tempId: { type: 'string' }, kind: artifactKindEnum, content: artifactContentSchema },
@@ -211,7 +278,7 @@ const nullableMethodDraftSchema: object = {
 const tendencyDraftSchema: object = schema(
   {
     title: { type: 'string' },
-    scope: { type: 'string', enum: ['action_selection', 'method_selection'] },
+    scope: { type: 'string', enum: ['action_selection', 'method_selection', 'entity_resolution'] },
     applicabilityText: { type: 'string' },
     preferenceText: { type: 'string' },
     preferIds: { type: 'array', items: { type: 'string' } },
@@ -226,7 +293,7 @@ const nullableTendencyDraftSchema: object = {
   type: ['object', 'null'],
   properties: {
     title: { type: 'string' },
-    scope: { type: 'string', enum: ['action_selection', 'method_selection'] },
+    scope: { type: 'string', enum: ['action_selection', 'method_selection', 'entity_resolution'] },
     applicabilityText: { type: 'string' },
     preferenceText: { type: 'string' },
     preferIds: { type: 'array', items: { type: 'string' } },
@@ -388,10 +455,11 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
   primitiveAction(
     'seed.search',
     '搜索',
-    '按明确的检索请求执行文本检索：显式 ID、名称/别名精确、搜索词精确、全文排名，并做显式关联一跳扩展。role 条件只能收窄候选。',
+    '按明确的检索请求执行文本检索：显式 ID、名称/别名精确、搜索词精确、全文排名，并做显式关联一跳扩展。支持上下文检索模式（object+concept 并排除 source=input，附带正文与一跳关联命题）与按主题汇总检索模式。role 条件只能收窄候选。',
     'search',
     schema(
       {
+        mode: { type: 'string', enum: ['default', 'context', 'topic_summary'] },
         queries: {
           type: 'array',
           items: queryItemSchema,
@@ -399,7 +467,14 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
         roles: { type: 'array', items: roleEnum },
         actionId: { type: 'string' },
         limit: { type: 'integer' },
-        tendencyScope: { type: 'string', enum: ['action_selection', 'method_selection'] },
+        excludeInputProvenance: { type: 'boolean' },
+        sourceText: { type: 'string' },
+        maxObjects: { type: 'integer' },
+        maxStatements: { type: 'integer' },
+        maxRelatedPerObject: { type: 'integer' },
+        topicRef: refSchema,
+        topicQuery: { type: 'string' },
+        tendencyScope: { type: 'string', enum: ['action_selection', 'method_selection', 'entity_resolution'] },
         anchorIds: { type: 'array', items: {} },
         allowedActionIds: { type: 'array', items: { type: 'string' } },
         contentActionsOnly: { type: 'boolean' },
@@ -407,11 +482,12 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
         contextTask: { type: 'string' },
         contextCandidates: { type: 'array', items: {} },
       },
-      ['queries'],
+      [],
     ),
     {
       type: 'object',
       properties: {
+        status: { type: 'string', enum: ['ready', 'needs_resolution', 'no_topic'] },
         items: {
           type: 'array',
           items: schema(
@@ -419,6 +495,15 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
             ['ref', 'title', 'roles', 'score', 'channel'],
           ),
         },
+        objects: { type: 'array', items: {} },
+        statements: { type: 'array', items: {} },
+        truncated: {},
+        hasExistingContext: { type: 'boolean' },
+        topic: { type: ['object', 'null'] },
+        ambiguousTopics: { type: 'array', items: {} },
+        directStatements: { type: 'array', items: {} },
+        relatedContextStatements: { type: 'array', items: {} },
+        allowedSourceRefs: { type: 'array', items: refSchema },
         defaultMethod: refSchema,
         tendencyRefs: { type: 'array', items: refSchema },
       },
@@ -475,6 +560,42 @@ export const PRIMITIVE_ACTION_SEEDS: SeedCons[] = [
       ['connected'],
     ),
     ['link', 'activate', 'append_event'],
+  ),
+  primitiveAction(
+    'seed.materialize_and_connect',
+    '原子物化并接入',
+    '在单个受控事务内完成校验、形成新建内容、映射复用对象、验证全部端点与关系类型、激活获准的新内容、建立或复用结构边并追加证据来源，以及幂等保存结果。任一步失败整个批次全部回滚，绝不修改或重激活复用对象。',
+    'materialize_and_connect',
+    schema(
+      {
+        artifacts: { type: 'array', items: formCandidateItem },
+        links: { type: 'array', items: linkItemSchema },
+        associations: { type: 'array', items: associationItemSchema },
+        metadata: { type: 'array', items: metadataItemSchema },
+        inputRef: refSchema,
+        activate: { type: 'boolean' },
+        allowRelationTypeActivation: { type: 'boolean' },
+        summaryDraft: summarizeTopicOutputSchema,
+        topicRef: refSchema,
+        updateSummaryRef: schema(
+          { consId: { type: 'string' }, expectedRevision: { type: 'integer' } },
+          ['consId', 'expectedRevision'],
+        ),
+      },
+      [],
+    ),
+    schema(
+      {
+        connected: { type: 'array', items: refSchema },
+        created: { type: 'array', items: refSchema },
+        reused: { type: 'array', items: refSchema },
+        edges: { type: 'array', items: { type: 'string' } },
+        reusedEdges: { type: 'array', items: { type: 'string' } },
+        tempMappings: { type: 'object' },
+      },
+      ['connected', 'created', 'reused', 'edges'],
+    ),
+    ['create_draft', 'create_revision', 'link', 'activate', 'append_event'],
   ),
   primitiveAction(
     'seed.record',
@@ -563,6 +684,66 @@ export const LLM_ACTION_SEEDS: SeedCons[] = [
     ['分类', '归属'],
   ),
   llmAction(
+    'seed.resolve_entities',
+    '辨认已有对象',
+    '将当前局部提案中的 object/concept 临时项与提供的已有候选集合进行身份辨认，逐一决定 reuse（复用精确已有 ref）、create（新建对象）或 unresolved（存在歧义暂不能确定）。不自行修改已有对象，不编造候选之外的 ID。',
+    schema(
+      {
+        input: {},
+        task: { type: 'string' },
+        artifacts: { type: 'array', items: {} },
+        links: { type: 'array', items: {} },
+        availableObjects: { type: 'array', items: {} },
+        availableStatements: { type: 'array', items: {} },
+        truncated: {},
+      },
+      ['input', 'artifacts', 'availableObjects'],
+    ),
+    entityResolutionOutputSchema,
+    F_CHOOSE_FILL,
+    ['对象辨认', '实体对齐'],
+  ),
+  llmAction(
+    'seed.associate_context',
+    '关联已有上下文',
+    '在当前批次提案、已确认对象映射与提供的一跳已有上下文范围内，仅提出明确有来源的有限跨输入关系（如所属/组成/位置、人物与经历关联、命题描述已有对象）。不做开放式联想，不推测未提供事实；无明确关系返回空数组。',
+    schema(
+      {
+        input: {},
+        task: { type: 'string' },
+        artifacts: { type: 'array', items: {} },
+        links: { type: 'array', items: {} },
+        resolutions: { type: 'array', items: {} },
+        availableObjects: { type: 'array', items: {} },
+        availableStatements: { type: 'array', items: {} },
+        truncated: {},
+      },
+      ['input', 'artifacts', 'resolutions', 'availableObjects'],
+    ),
+    associateContextOutputSchema,
+    F_FILL,
+    ['跨输入关联', '上下文关联'],
+  ),
+  llmAction(
+    'seed.summarize_topic',
+    '按主题汇总记录',
+    '基于指定主题对象及其已关联的命题与来源记录，按阶段或主题生成带来源引用的汇总草案。不增加未提供事实、不把缺失材料当否定、区分录取/就读/毕业、保留主观评价来源、不覆盖原始命题。',
+    schema(
+      {
+        task: { type: 'string' },
+        topic: {},
+        directStatements: { type: 'array', items: {} },
+        relatedContextStatements: { type: 'array', items: {} },
+        allowedSourceRefs: { type: 'array', items: refSchema },
+        truncated: { type: 'boolean' },
+      },
+      ['task', 'topic', 'directStatements', 'allowedSourceRefs'],
+    ),
+    summarizeTopicOutputSchema,
+    F_FILL,
+    ['主题汇总', '经历汇总'],
+  ),
+  llmAction(
     'seed.prepare_connections',
     '准备接入描述',
     '按 tempId 为已确定的候选产物补充别名（aliases）、检索词（searchTerms）及可选适用描述（applicabilityText），不重写正文与关系结构。',
@@ -646,11 +827,17 @@ const CUSTOM_DEFAULT_INSTRUCTIONS: Record<string, string> = {
   'seed.select_method':
     '在 availableMethods 中选择最匹配当前输入情境的方法；若无更专用的方法，则采用 defaultMethod 并标记 usedDefaultFreedom=true。usedTendencies 只填写实际参考的倾向 consId，无则 []。',
   'seed.decompose':
-    '将输入拆解为精炼的对象（object）、关键命题（proposition）和关系实例（links）。每项 content 必须包含简明的 title 与 body；优先复用 availableRelationTypes 中已有关系类型（kind="existing"），确需新关系且步骤允许时再以 kind="relation_type" 提出并在 links 中用 kind="draft" 引用。控制条目数量与长度，避免冗长重复。',
+    '将输入拆解为精炼的对象（object/concept）、关键命题（proposition）和局部关系实例（links）。每项 content 必须包含简明的 title 与 body；局部对象使用本批次 tempId（后续由「辨认已有对象」步骤与已有实体对齐，不在本步骤直接填已有 consId）。优先复用 availableRelationTypes 中已有关系类型（kind="existing"），确需新关系且步骤允许时再以 kind="relation_type" 提出并在 links 中用 kind="draft" 引用。控制条目数量与长度，避免冗长重复。',
   'seed.classify':
-    '识别输入中的对象、类别归属及否定归属，形成对象（object）与归属命题（proposition）及必要关系（links）。若输入 candidates 中已有匹配概念，可基于候选说明归属；若 candidates 为空或未提供，直接基于输入文本生成对象和归属命题提案，不得猜测系统中未提供的概念ID。',
+    '识别输入中的对象、类别归属及否定归属，形成对象（object/concept）与归属命题（proposition）及必要关系（links）。若输入 candidates 或 availableObjects 中已有匹配概念，可基于候选说明归属；若候选为空或未提供，直接基于输入文本生成对象和归属命题提案，不得猜测系统中未提供的概念ID。',
+  'seed.resolve_entities':
+    '对输入 artifacts 中所有 kind 为 object 或 concept 的局部提案逐一辨认（proposition 与 relation_type 不参与对象对齐）：1) 同名只是线索，必须结合当前输入语料、局部提案内容、availableObjects 中候选的正文（body）、别名（aliases）及已有直接关联命题（relatedStatements）综合判断；2) 若 availableObjects 中存在唯一且语境一致的对应已有实体（如同一人物的连续经历、同一学校的不同信息），选择 decision="reuse" 并精确填写 existingRef={consId,revision}；3) 若 availableObjects 为空、或候选中不存在该实体、或输入明确指出了同名不同实体（有身份区分信息），选择 decision="create" 且不得填写 existingRef；4) 若 availableObjects 中存在多个同名或近似候选且无法根据已知信息唯一判定，选择 decision="unresolved"、列出歧义 candidateRefs 并将顶层 status 设为 "needs_resolution"，绝不按排名盲目选第一个，也不偷偷按 create 处理；5) 每条决定必须写明简洁依据 basis，tempId 不得遗漏或重复。全部非 unresolved 时 status 必须为 "resolved"。',
+  'seed.associate_context':
+    '在当前提案、已确认 resolutions 与本次提供的 availableObjects/availableStatements 范围内，仅提出明确有来源的新跨输入内容关系；本批次局部 links 经对象复用后已表达的关系无需重复输出，若无新增跨输入关系请直接简洁返回 {"associations":[]}。允许：明确的所属/组成/位置关系（如某校食堂 rel.part_of 既有学校对象）、人物与明确陈述经历的关联、当前命题明确描述已有对象（rel.describes）、对已知同一对象的阶段性描述。严禁：开放式联想、引入外部背景知识、从“学校包含初中/高中”推出“人物在那里读了初中/高中”、把“高考考上/被录取”加强为“毕业”、把推测写成事实、重复输出 links 中已表达的相同边。端点使用显式联合类型：{kind:"draft",tempId} 或 {kind:"existing",ref:{consId,revision}}；relation 使用 {kind:"existing",ref} 或 {kind:"draft",tempId}；每条关系必须提供非空 evidenceRefs（取自当前输入 input.consRef 或相关既有命题/对象 ref）与简短 basis。',
+  'seed.summarize_topic':
+    '根据提供的主题对象（topic）、直接关联命题（directStatements）与相关实体背景命题（relatedContextStatements），按阶段或主题形成简洁忠实的汇总草案：1) 仅组织已提供的事实，严禁补写未提供信息；2) 严格区分“就读”“录取/考上”“毕业”，区分“学校包含某学段”与“个人就读某学段”，不得混淆；3) 未提供的学段、学校或毕业状态明确留空并记入 openQuestions，不把缺失材料当否定事实；4) 保留主观评价（如食堂口味比较）的陈述来源，不改写成客观定论；5) sourceRefs 必须仅从 allowedSourceRefs 中选取并覆盖汇总依据的记录；coverage 列出本次已覆盖的阶段或条目。',
   'seed.prepare_connections':
-    '仅针对输入 artifacts 的 tempId 补充简洁的 aliases、searchTerms（及必要的 applicabilityText），用于后续检索接入；不要重写 title、body 或生成边结构。',
+    '仅针对输入 artifacts（已排除复用对象，仅含本次需新建项）的 tempId 补充简洁的 aliases、searchTerms（及必要的 applicabilityText），用于后续检索接入；不要重写 title、body 或生成边结构。若输入 artifacts 为空数组，返回 {"metadata":[]}。',
   'seed.extract_method':
     '从本次案例中判断是否存在值得复用的通用执行步骤：若有，返回 status="proposed" 与简洁的 method 草案（actionId 必须取自 availableActions）；若本次只是常规单次执行或无清晰复用模式，返回 status="none"。',
   'seed.extract_tendency':
@@ -700,6 +887,23 @@ export const TENDENCY_SEEDS: SeedCons[] = [
       avoidIds: [],
     } satisfies TendencySpec,
   },
+  {
+    id: 'tendency.check_existing_objects',
+    title: '优先核查已有对象',
+    roles: ['tendency'],
+    body: '新建实体前优先核查已检索到的对象正文与关联经历；上下文一致且唯一时复用已有对象，明确不同则新建，存在歧义时返回 unresolved，不凭同名盲目合并。',
+    aliases: ['已有对象优先核查', '先查已有对象'],
+    searchTerms: ['已有对象', '复用', '实体对齐', '对象辨认'],
+    applicabilityText: '对象辨认与实体对齐情境。',
+    spec: {
+      kind: 'tendency',
+      scope: 'entity_resolution',
+      applicabilityText: '正在对局部对象提案执行已有对象辨认时。',
+      preferenceText: '优先对照候选正文与已有直接关联命题判断是否同一实体；不因同名无条件合并，也不忽略明显同一的既有对象。',
+      preferIds: [],
+      avoidIds: [],
+    } satisfies TendencySpec,
+  },
 ];
 
 const flowIngest: FlowSpec = {
@@ -716,15 +920,21 @@ const flowIngest: FlowSpec = {
       actionId: 'seed.make_query',
       inputBindings: { input: { source: 'state', path: 'inputCons' }, task: { source: 'run', path: 'task' } },
       outputKey: 'actionQuery',
-      next: 'search_concepts',
+      next: 'retrieve_context',
     },
-    search_concepts: {
+    retrieve_context: {
       actionId: 'seed.search',
       inputBindings: {
+        mode: { source: 'literal', value: 'context' },
         queries: { source: 'state', path: 'actionQuery.queries' },
-        roles: { source: 'literal', value: ['concept'] },
+        roles: { source: 'literal', value: ['object', 'concept'] },
+        excludeInputProvenance: { source: 'literal', value: true },
+        sourceText: { source: 'state', path: 'inputCons.text' },
+        maxObjects: { source: 'literal', value: 20 },
+        maxStatements: { source: 'literal', value: 20 },
+        maxRelatedPerObject: { source: 'literal', value: 5 },
       },
-      outputKey: 'conceptCandidates',
+      outputKey: 'contextBundle',
       next: 'search_actions',
     },
     search_actions: {
@@ -736,7 +946,7 @@ const flowIngest: FlowSpec = {
         contentActionsOnly: { source: 'literal', value: true },
         contextInput: { source: 'state', path: 'inputCons' },
         contextTask: { source: 'run', path: 'task' },
-        contextCandidates: { source: 'state', path: 'conceptCandidates.items' },
+        contextCandidates: { source: 'state', path: 'contextBundle.items' },
       },
       outputKey: 'actionCandidates',
       next: 'search_action_tendencies',
@@ -803,33 +1013,73 @@ const flowIngest: FlowSpec = {
         task: { source: 'run', path: 'task' },
       },
       optionalInputBindings: {
-        candidates: { source: 'state', path: 'conceptCandidates.items' },
+        candidates: { source: 'state', path: 'contextBundle.objects' },
       },
       outputKey: 'actionResult',
+      next: 'search_resolution_tendencies',
+    },
+    search_resolution_tendencies: {
+      actionId: 'seed.search',
+      inputBindings: {
+        queries: { source: 'state', path: 'actionQuery.queries' },
+        tendencyScope: { source: 'literal', value: 'entity_resolution' },
+      },
+      outputKey: 'tendencyRefs',
+      next: 'resolve_entities',
+    },
+    resolve_entities: {
+      actionId: 'seed.resolve_entities',
+      inputBindings: {
+        input: { source: 'state', path: 'inputCons' },
+        task: { source: 'run', path: 'task' },
+        artifacts: { source: 'state', path: 'actionResult.artifacts' },
+        links: { source: 'state', path: 'actionResult.links' },
+        availableObjects: { source: 'state', path: 'contextBundle.objects' },
+        availableStatements: { source: 'state', path: 'contextBundle.statements' },
+        truncated: { source: 'state', path: 'contextBundle.truncated' },
+      },
+      outputKey: 'entityResolution',
+      transitions: [{ field: 'status', equals: 'needs_resolution', next: 'await_resolution' }],
+      next: 'associate_context',
+    },
+    await_resolution: {
+      inputBindings: {},
+      outputKey: 'pendingResolution',
+      terminal: true,
+      pauseStatus: 'needs_resolution',
+    },
+    associate_context: {
+      actionId: 'seed.associate_context',
+      allowRelationTypeProposals: true,
+      inputBindings: {
+        input: { source: 'state', path: 'inputCons' },
+        task: { source: 'run', path: 'task' },
+        artifacts: { source: 'state', path: 'actionResult.artifacts' },
+        links: { source: 'state', path: 'actionResult.links' },
+        resolutions: { source: 'state', path: 'entityResolution.resolutions' },
+        availableObjects: { source: 'state', path: 'contextBundle.objects' },
+        availableStatements: { source: 'state', path: 'contextBundle.statements' },
+        truncated: { source: 'state', path: 'contextBundle.truncated' },
+      },
+      outputKey: 'contextAssociations',
       next: 'prepare_connections',
     },
     prepare_connections: {
       actionId: 'seed.prepare_connections',
       inputBindings: {
-        artifacts: { source: 'state', path: 'actionResult.artifacts' },
+        artifacts: { source: 'state', path: 'entityResolution.createArtifacts' },
       },
       outputKey: 'connectionProposals',
-      next: 'form_content',
+      next: 'materialize_and_connect',
     },
-    form_content: {
-      actionId: 'seed.form',
+    materialize_and_connect: {
+      actionId: 'seed.materialize_and_connect',
       inputBindings: {
-        candidates: { source: 'state', path: 'actionResult.artifacts' },
+        artifacts: { source: 'state', path: 'actionResult.artifacts' },
+        links: { source: 'state', path: 'actionResult.links' },
+        associations: { source: 'state', path: 'contextAssociations.associations' },
         metadata: { source: 'state', path: 'connectionProposals.metadata' },
-      },
-      outputKey: 'formedContent',
-      next: 'connect_content',
-    },
-    connect_content: {
-      actionId: 'seed.connect',
-      inputBindings: {
-        formed: { source: 'state', path: 'formedContent.formed' },
-        edges: { source: 'state', path: 'actionResult.links' },
+        inputRef: { source: 'state', path: 'inputCons.consRef' },
         activate: { source: 'literal', value: true },
         allowRelationTypeActivation: { source: 'literal', value: true },
       },
@@ -1056,16 +1306,88 @@ const flowReviseMethod: FlowSpec = {
   },
 };
 
+const flowSummarizeTopic: FlowSpec = {
+  kind: 'flow',
+  entry: 'collect_topic_context',
+  nodes: {
+    collect_topic_context: {
+      actionId: 'seed.search',
+      inputBindings: {
+        mode: { source: 'literal', value: 'topic_summary' },
+        maxStatements: { source: 'literal', value: 40 },
+      },
+      optionalInputBindings: {
+        topicRef: { source: 'run', path: 'input.topicRef' },
+        topicQuery: { source: 'run', path: 'input.topicQuery' },
+      },
+      outputKey: 'topicContext',
+      transitions: [
+        { field: 'status', equals: 'needs_resolution', next: 'await_resolution' },
+        { field: 'status', equals: 'no_topic', next: 'finish' },
+      ],
+      next: 'summarize_topic',
+    },
+    await_resolution: {
+      inputBindings: {},
+      outputKey: 'pendingResolution',
+      terminal: true,
+      pauseStatus: 'needs_resolution',
+    },
+    summarize_topic: {
+      actionId: 'seed.summarize_topic',
+      inputBindings: {
+        task: { source: 'run', path: 'task' },
+        topic: { source: 'state', path: 'topicContext.topic' },
+        directStatements: { source: 'state', path: 'topicContext.directStatements' },
+        relatedContextStatements: { source: 'state', path: 'topicContext.relatedContextStatements' },
+        allowedSourceRefs: { source: 'state', path: 'topicContext.allowedSourceRefs' },
+        truncated: { source: 'state', path: 'topicContext.truncated' },
+      },
+      outputKey: 'summaryDraft',
+      next: 'materialize_summary',
+    },
+    materialize_summary: {
+      actionId: 'seed.materialize_and_connect',
+      inputBindings: {
+        summaryDraft: { source: 'state', path: 'summaryDraft' },
+        topicRef: { source: 'state', path: 'topicContext.topic.ref' },
+        activate: { source: 'literal', value: true },
+      },
+      optionalInputBindings: {
+        updateSummaryRef: { source: 'run', path: 'input.updateSummaryRef' },
+      },
+      outputKey: 'connectedSummary',
+      next: 'finish',
+    },
+    finish: {
+      inputBindings: {},
+      outputKey: 'done',
+      terminal: true,
+    },
+  },
+};
+
 export const FLOW_SEEDS: SeedCons[] = [
   {
     id: 'flow.ingest',
     title: '语料接收与处理流程',
     roles: ['flow'],
-    body: '接收并处理语料：接收、生成检索表达、检索已知概念候选、按权限与实际输入适配筛选并选择动作及其 action_selection 倾向（无候选时直接结束）、检索并选择方法及其 method_selection 倾向、执行所选动作、补充检索元数据、由底座形成并按序接入内容与获准新关系类型、记录主阶段案例，随后执行一次内化流程。',
+    body: '接收并处理语料：接收、生成检索表达、检索已有对象/概念及相关命题上下文（排除输入语料对象）、选择动作与方法、执行内容动作产生局部提案、执行已有对象辨认（存在歧义则暂停返回 needs_resolution）、执行有限跨输入关联、仅对新建项补充元数据、在单事务内原子形成并接入（复用对象不覆写不重激活、结构边去重并追加证据）、记录主阶段案例，随后执行一次内化流程。',
     aliases: ['ingest'],
     searchTerms: ['ingest', '接收', '语料处理'],
     applicabilityText: '默认语料处理入口。',
     spec: flowIngest,
+    binding: { executor: 'flow' },
+  },
+  {
+    id: 'flow.summarize_topic',
+    title: '按主题汇总记录流程',
+    roles: ['flow'],
+    body: '按用户请求针对指定主题对象检索关联命题及来源（多同名未消歧对象时暂停返回 needs_resolution 而不混合），生成带来源引用、覆盖范围与未知问题的汇总草案，校验全部 sourceRefs 后形成新汇总记录或新增修订，保留原始记录。',
+    aliases: ['summarize_topic', '主题汇总'],
+    searchTerms: ['summarize_topic', '主题汇总', '经历汇总', '汇总'],
+    applicabilityText: '用户显式请求按主题汇总已关联记录时。',
+    spec: flowSummarizeTopic,
     binding: { executor: 'flow' },
   },
   {

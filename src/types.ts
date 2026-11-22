@@ -43,7 +43,7 @@ export interface MethodSpec {
 
 export interface TendencySpec {
   kind: 'tendency';
-  scope: 'action_selection' | 'method_selection';
+  scope: 'action_selection' | 'method_selection' | 'entity_resolution';
   applicabilityText: string;
   preferenceText: string;
   preferIds: string[];
@@ -72,6 +72,12 @@ export interface FlowNode {
     next: string;
   }[];
   terminal?: boolean;
+  /**
+   * When terminal is true and pauseStatus is set (e.g. 'needs_resolution'),
+   * the flow stops with that business status instead of 'completed' so the caller
+   * can supply explicit confirmation and resume later.
+   */
+  pauseStatus?: 'needs_resolution';
 }
 
 export type Binding =
@@ -117,6 +123,8 @@ export interface ConsEdge {
   to: ConsRef;
   createdByStepId?: string;
   status: 'active' | 'archived';
+  /** Supporting evidence references attached to this edge across inputs. */
+  evidenceRefs?: ConsRef[];
 }
 
 export interface ExecutionBinding {
@@ -151,11 +159,11 @@ export interface RunBudget {
 
 export const DEFAULT_BUDGET: RunBudget = {
   maxSteps: 64,
-  maxLlmCalls: 20,
-  maxOutputTokensPerCall: 4096,
+  maxLlmCalls: 24,
+  maxOutputTokensPerCall: 8192,
 };
 
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'budget_exhausted';
+export type RunStatus = 'queued' | 'running' | 'completed' | 'needs_resolution' | 'failed' | 'budget_exhausted';
 
 export interface Run {
   id: string;
@@ -196,7 +204,7 @@ export interface ArtifactContent {
 
 export interface Artifact {
   tempId: string;
-  kind: 'object' | 'proposition' | 'relation_type' | 'relation' | 'method' | 'tendency' | 'action';
+  kind: 'object' | 'concept' | 'proposition' | 'relation_type' | 'method' | 'tendency' | 'action';
   content: ArtifactContent | unknown;
 }
 
@@ -204,10 +212,74 @@ export type RelationTarget =
   | { kind: 'existing'; ref: ConsRef }
   | { kind: 'draft'; tempId: string };
 
+/** Explicit union endpoint for cross-input associations (P1). */
+export type EndpointTarget =
+  | { kind: 'existing'; ref: ConsRef }
+  | { kind: 'draft'; tempId: string };
+
 export interface ArtifactLink {
   fromTempId: string;
   relation: RelationTarget;
   toTempId: string;
+}
+
+export interface ContextAssociation {
+  from: EndpointTarget;
+  relation: RelationTarget;
+  to: EndpointTarget;
+  evidenceRefs: ConsRef[];
+  basis: string;
+}
+
+export interface RelatedStatementItem {
+  ref: ConsRef;
+  relationConsId: string;
+  direction: 'from' | 'to';
+  title: string;
+  body: string;
+  sourceRefs: ConsRef[];
+}
+
+export interface EntityCandidate {
+  ref: ConsRef;
+  title: string;
+  roles: ConsRole[];
+  body: string;
+  aliases: string[];
+  searchTerms: string[];
+  sourceRefs: ConsRef[];
+  relatedStatements: RelatedStatementItem[];
+}
+
+export interface StatementCandidate {
+  ref: ConsRef;
+  title: string;
+  roles: ConsRole[];
+  body: string;
+  sourceRefs: ConsRef[];
+  relatedObjects: Array<{ ref: ConsRef; title: string; relationConsId: string }>;
+}
+
+export interface EntityResolutionItem {
+  tempId: string;
+  decision: 'reuse' | 'create' | 'unresolved';
+  existingRef?: ConsRef | null;
+  candidateRefs?: ConsRef[];
+  basis: string;
+}
+
+export interface ResolutionDecisionInput {
+  tempId: string;
+  decision: 'reuse' | 'create';
+  existingRef?: ConsRef;
+  basis?: string;
+}
+
+export interface SummarizeTopicInput {
+  topicRef?: ConsRef;
+  topicQuery?: string;
+  task?: string;
+  updateSummaryRef?: { consId: string; expectedRevision: number };
 }
 
 export interface AvailableRefItem {
@@ -222,6 +294,8 @@ export interface AvailableReferences {
   availableMethods?: AvailableRefItem[];
   availableTendencies?: AvailableRefItem[];
   availableRelationTypes?: AvailableRefItem[];
+  availableObjects?: EntityCandidate[];
+  availableStatements?: StatementCandidate[];
 }
 
 export interface ExecutionEnvelope {
@@ -248,10 +322,17 @@ export interface SearchResultItem {
   channel: 'id' | 'name' | 'searchTerm' | 'fts' | 'assoc';
 }
 
+export interface TrustedSnapshot<T = unknown> {
+  stepId: string;
+  payload: T;
+}
+
 export interface SearchQuery {
   text: string;
   roles?: ConsRole[];
   limit?: number;
+  /** When true, exclude raw input corpus cons (provenance.source === 'input'). */
+  excludeInputProvenance?: boolean;
 }
 
 export interface SearchResponse {

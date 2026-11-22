@@ -7,9 +7,13 @@ import type {
   ConsRevision,
   ConsRole,
   EffectKind,
+  EntityCandidate,
+  EntityResolutionItem,
   FlowNode,
   FlowSpec,
+  RelatedStatementItem,
   SearchResultItem,
+  StatementCandidate,
   Step,
 } from '../types.js';
 import type { ConsStoreApi } from '../store/api.js';
@@ -23,6 +27,35 @@ export const REL_USED_TENDENCY = 'rel.used_tendency';
 export const REL_DERIVED_FROM = 'rel.derived_from';
 export const REL_PREFERS = 'rel.prefers';
 export const REL_AVOIDS = 'rel.avoids';
+export const REL_DESCRIBES = 'rel.describes';
+export const REL_PART_OF = 'rel.part_of';
+
+export const TRUSTED_SNAPSHOT_ENTITY_CONTEXT = 'entity_context';
+export const TRUSTED_SNAPSHOT_ENTITY_RESOLUTION = 'entity_resolution';
+export const TRUSTED_SNAPSHOT_SUMMARY_CONTEXT = 'summary_context';
+
+export interface TrustedEntityContextSnapshot {
+  objectRefs: ConsRef[];
+  statementRefs: ConsRef[];
+  truncated: { objects: boolean; statements: boolean };
+}
+
+export interface TrustedEntityResolutionSnapshot {
+  batchStepId: string;
+  candidateSnapshotStepId: string | null;
+  resolutions: EntityResolutionItem[];
+  tempIdToExistingRef: Record<string, ConsRef>;
+  createTempIds: string[];
+  unresolvedTempIds: string[];
+  confirmedByHuman?: boolean;
+}
+
+export interface TrustedSummaryContextSnapshot {
+  status: 'ready' | 'needs_resolution' | 'no_topic';
+  topicRef: ConsRef | null;
+  ambiguousTopicRefs: ConsRef[];
+  allowedSourceRefs: ConsRef[];
+}
 
 const MAX_QUERIES = 4;
 const PER_QUERY_LIMIT = 20;
@@ -97,17 +130,38 @@ export function connectResultKey(stepId: string): string {
   return `${stepId}:connect`;
 }
 
+export function materializeResultKey(stepId: string): string {
+  return `${stepId}:materialize_and_connect`;
+}
+
+function refKey(ref: ConsRef): string {
+  return `${ref.consId}@${String(ref.revision)}`;
+}
+
 export async function searchCore(
   store: ConsStoreApi,
   queries: CoreQuery[],
-  opts?: { limit?: number; coldStartRole?: ConsRole; runId?: string; stepId?: string; expansionTexts?: string[]; allowedIds?: string[] },
+  opts?: {
+    limit?: number;
+    coldStartRole?: ConsRole;
+    runId?: string;
+    stepId?: string;
+    expansionTexts?: string[];
+    allowedIds?: string[];
+    excludeInputProvenance?: boolean;
+  },
 ): Promise<SearchResultItem[]> {
   const qs = queries.slice(0, MAX_QUERIES);
   const allowedSet = opts !== undefined && opts.allowedIds !== undefined ? new Set(opts.allowedIds) : null;
+  const excludeInput = opts?.excludeInputProvenance === true;
   const best = new Map<string, SearchResultItem>();
   const collect = async (text: string, roles?: ConsRole[]): Promise<void> => {
-    const query: { text: string; roles?: ConsRole[]; limit: number } = { text, limit: PER_QUERY_LIMIT };
+    const query: { text: string; roles?: ConsRole[]; limit: number; excludeInputProvenance?: boolean } = {
+      text,
+      limit: PER_QUERY_LIMIT,
+    };
     if (roles !== undefined) query.roles = roles;
+    if (excludeInput) query.excludeInputProvenance = true;
     const resp = await store.search(query);
     for (const item of resp.items) {
       if (allowedSet !== null && !allowedSet.has(item.ref.consId)) continue;
@@ -128,6 +182,10 @@ export async function searchCore(
       const listed = await store.listActiveConsByRole(role, COLD_START_LIMIT);
       for (const l of listed) {
         if (allowedSet !== null && !allowedSet.has(l.ref.consId)) continue;
+        if (excludeInput) {
+          const rev = await store.getRevision(l.ref.consId, l.ref.revision);
+          if (rev?.provenance.source === 'input') continue;
+        }
         if (!best.has(l.ref.consId)) {
           best.set(l.ref.consId, { ref: l.ref, title: l.title, roles: [role], score: 0, channel: 'assoc' });
         }
@@ -168,14 +226,17 @@ export async function searchCore(
 export async function tendencyCandidatesCore(
   store: ConsStoreApi,
   queries: CoreQuery[],
-  scope: 'action_selection' | 'method_selection',
+  scope: 'action_selection' | 'method_selection' | 'entity_resolution',
   anchors: unknown,
 ): Promise<ConsRef[]> {
   const roleQueries: CoreQuery[] = queries.map((q) => ({
     text: q.text,
     roles: [...(q.roles ?? []), 'tendency' as ConsRole],
   }));
-  const items = await searchCore(store, roleQueries, { limit: TENDENCY_LIMIT });
+  const items = await searchCore(store, roleQueries, {
+    limit: TENDENCY_LIMIT,
+    ...(scope === 'entity_resolution' ? { coldStartRole: 'tendency' as ConsRole } : {}),
+  });
   const ids = new Set<string>();
   for (const item of items) ids.add(item.ref.consId);
   const anchorIds = new Set<string>();
@@ -315,8 +376,486 @@ async function receivePrimitive(ctx: StepContext): Promise<unknown> {
   });
 }
 
+/**
+ * Hydrate an active object/concept cons with its body, aliases, provenance,
+ * and up to `maxRelated` one-hop related proposition statements.
+ */
+async function buildEntityCandidate(
+  store: ConsStoreApi,
+  ref: ConsRef,
+  maxRelated: number,
+): Promise<{ candidate: EntityCandidate; relatedTruncated: boolean } | null> {
+  const cons = await store.getCons(ref.consId);
+  if (cons === null || cons.status !== 'active') return null;
+  const rev = await store.getRevision(ref.consId, ref.revision);
+  if (rev === null || rev.provenance.source === 'input') return null;
+  const edges = await store.listEdges(ref.consId, 'both', true);
+  const relatedStatements: RelatedStatementItem[] = [];
+  const seenStmt = new Set<string>();
+  let relatedTruncated = false;
+  for (const edge of edges) {
+    const isFrom = edge.from.consId === ref.consId;
+    const otherRef = isFrom ? edge.to : edge.from;
+    const key = refKey(otherRef);
+    if (seenStmt.has(key)) continue;
+    const otherCons = await store.getCons(otherRef.consId);
+    if (otherCons === null || otherCons.status !== 'active') continue;
+    const otherRev = await store.getRevision(otherRef.consId, otherRef.revision);
+    if (otherRev === null || !otherRev.roles.includes('proposition')) continue;
+    if (relatedStatements.length >= maxRelated) {
+      relatedTruncated = true;
+      break;
+    }
+    seenStmt.add(key);
+    relatedStatements.push({
+      ref: otherRef,
+      relationConsId: edge.relationConsId,
+      direction: isFrom ? 'from' : 'to',
+      title: otherRev.title,
+      body: otherRev.body,
+      sourceRefs: otherRev.provenance.sourceRefs,
+    });
+  }
+  return {
+    candidate: {
+      ref,
+      title: rev.title,
+      roles: rev.roles,
+      body: rev.body,
+      aliases: rev.aliases,
+      searchTerms: rev.searchTerms,
+      sourceRefs: rev.provenance.sourceRefs,
+      relatedStatements,
+    },
+    relatedTruncated,
+  };
+}
+
+/**
+ * Hydrate an active proposition cons with its body, provenance sourceRefs,
+ * and one-hop related objects/concepts.
+ */
+async function buildStatementCandidate(
+  store: ConsStoreApi,
+  ref: ConsRef,
+): Promise<StatementCandidate | null> {
+  const cons = await store.getCons(ref.consId);
+  if (cons === null || cons.status !== 'active') return null;
+  const rev = await store.getRevision(ref.consId, ref.revision);
+  if (rev === null || !rev.roles.includes('proposition')) return null;
+  const edges = await store.listEdges(ref.consId, 'both', true);
+  const relatedObjects: Array<{ ref: ConsRef; title: string; relationConsId: string }> = [];
+  const seenObj = new Set<string>();
+  for (const edge of edges) {
+    const otherRef = edge.from.consId === ref.consId ? edge.to : edge.from;
+    const key = refKey(otherRef);
+    if (seenObj.has(key)) continue;
+    const otherCons = await store.getCons(otherRef.consId);
+    if (otherCons === null || otherCons.status !== 'active') continue;
+    const otherRev = await store.getRevision(otherRef.consId, otherRef.revision);
+    if (otherRev === null || otherRev.provenance.source === 'input') continue;
+    if (!otherRev.roles.includes('object') && !otherRev.roles.includes('concept')) continue;
+    seenObj.add(key);
+    relatedObjects.push({
+      ref: otherRef,
+      title: otherRev.title,
+      relationConsId: edge.relationConsId,
+    });
+  }
+  return {
+    ref,
+    title: rev.title,
+    roles: rev.roles,
+    body: rev.body,
+    sourceRefs: rev.provenance.sourceRefs,
+    relatedObjects,
+  };
+}
+
+/**
+ * P0/P1 context retrieval mode for seed.search:
+ * Searches active object+concept cons (excluding raw source=input corpus objects),
+ * enriches each candidate with its body, aliases, sourceRefs, and bounded one-hop
+ * related propositions, gathers related proposition statements, records a trusted
+ * server-side snapshot, and returns truncation flags explicitly.
+ */
+async function contextSearchMode(
+  ctx: StepContext,
+  input: Record<string, unknown>,
+  queries: CoreQuery[],
+): Promise<unknown> {
+  const roles = Array.isArray(input['roles']) && input['roles'].length > 0
+    ? (input['roles'] as ConsRole[])
+    : (['object', 'concept'] as ConsRole[]);
+  const maxObjects = typeof input['maxObjects'] === 'number' && input['maxObjects'] > 0 ? input['maxObjects'] : 20;
+  const maxStatements = typeof input['maxStatements'] === 'number' && input['maxStatements'] > 0 ? input['maxStatements'] : 20;
+  const maxRelatedPerObject = typeof input['maxRelatedPerObject'] === 'number' && input['maxRelatedPerObject'] > 0
+    ? input['maxRelatedPerObject']
+    : 5;
+  const excludeInput = input['excludeInputProvenance'] !== false;
+  const sourceText = typeof input['sourceText'] === 'string' ? input['sourceText'] : '';
+
+  const objQueries: CoreQuery[] = queries.map((q) => ({ text: q.text, roles }));
+  if (sourceText.trim() !== '' && objQueries.length < MAX_QUERIES) {
+    objQueries.push({ text: sourceText.slice(0, 80), roles });
+  }
+  const objectPool = new Map<string, SearchResultItem>();
+  const addObjHit = (item: SearchResultItem): void => {
+    const prev = objectPool.get(item.ref.consId);
+    if (prev === undefined || CHANNEL_ORDER[item.channel] > CHANNEL_ORDER[prev.channel]) {
+      objectPool.set(item.ref.consId, item);
+    }
+  };
+
+  if (sourceText.trim() !== '') {
+    const mentioned = await ctx.store.findMentionedCons(sourceText, roles, {
+      excludeInputProvenance: excludeInput,
+      limit: maxObjects + 5,
+    });
+    for (const m of mentioned) addObjHit(m);
+  }
+  const searchedObjs = await searchCore(ctx.store, objQueries, {
+    limit: maxObjects + 5,
+    excludeInputProvenance: excludeInput,
+  });
+  for (const s of searchedObjs) addObjHit(s);
+
+  const sortedObjs = [...objectPool.values()].sort((a, b) => {
+    const p = CHANNEL_ORDER[b.channel] - CHANNEL_ORDER[a.channel];
+    if (p !== 0) return p;
+    return a.ref.consId < b.ref.consId ? -1 : 1;
+  });
+
+  const objects: EntityCandidate[] = [];
+  const items: SearchResultItem[] = [];
+  let objectsTruncated = false;
+  let anyRelatedTruncated = false;
+  const stmtMap = new Map<string, StatementCandidate>();
+
+  for (const hit of sortedObjs) {
+    const hydrated = await buildEntityCandidate(ctx.store, hit.ref, maxRelatedPerObject);
+    if (hydrated === null) continue;
+    if (objects.length >= maxObjects) {
+      objectsTruncated = true;
+      break;
+    }
+    objects.push(hydrated.candidate);
+    items.push(hit);
+    if (hydrated.relatedTruncated) anyRelatedTruncated = true;
+    for (const rs of hydrated.candidate.relatedStatements) {
+      const k = refKey(rs.ref);
+      if (!stmtMap.has(k)) {
+        const sc = await buildStatementCandidate(ctx.store, rs.ref);
+        if (sc !== null) stmtMap.set(k, sc);
+      }
+    }
+  }
+
+  // Also search active propositions directly to supply statement context.
+  const propQueries: CoreQuery[] = queries.map((q) => ({ text: q.text, roles: ['proposition' as ConsRole] }));
+  const searchedProps = propQueries.length > 0
+    ? await searchCore(ctx.store, propQueries, {
+        limit: maxStatements + 5,
+        excludeInputProvenance: true,
+      })
+    : [];
+  for (const sp of searchedProps) {
+    const k = refKey(sp.ref);
+    if (!stmtMap.has(k)) {
+      const sc = await buildStatementCandidate(ctx.store, sp.ref);
+      if (sc !== null) stmtMap.set(k, sc);
+    }
+  }
+
+  const allStatements = [...stmtMap.values()].sort((a, b) => (a.ref.consId < b.ref.consId ? -1 : 1));
+  const statementsTruncated = allStatements.length > maxStatements || anyRelatedTruncated;
+  const statements = allStatements.slice(0, maxStatements);
+
+  const snapshot: TrustedEntityContextSnapshot = {
+    objectRefs: objects.map((o) => o.ref),
+    statementRefs: statements.map((s) => s.ref),
+    truncated: { objects: objectsTruncated, statements: statementsTruncated },
+  };
+  await ctx.store.putTrustedSnapshot(ctx.run.id, TRUSTED_SNAPSHOT_ENTITY_CONTEXT, ctx.step.id, snapshot);
+
+  await ctx.store.appendEvent(
+    'retrieval_performed',
+    {
+      mode: 'context',
+      queries: objQueries,
+      objectRefs: snapshot.objectRefs,
+      statementRefs: snapshot.statementRefs,
+      truncated: snapshot.truncated,
+    },
+    ctx.run.id,
+    ctx.step.id,
+  );
+
+  return {
+    items,
+    objects,
+    statements,
+    truncated: snapshot.truncated,
+    hasExistingContext: objects.length > 0 || statements.length > 0,
+  };
+}
+
+/**
+ * P2 topic summary context collection mode for seed.search:
+ * Resolves a single target topic object (or pauses with needs_resolution if
+ * multiple homonymous objects exist without confirmed equivalence), collects
+ * its directly linked propositions and related-entity context propositions
+ * (clearly distinguished), and persists a trusted allowedSourceRefs snapshot.
+ */
+async function topicSummarySearchMode(
+  ctx: StepContext,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const maxStatements = typeof input['maxStatements'] === 'number' && input['maxStatements'] > 0 ? input['maxStatements'] : 40;
+  const topicRefRaw = input['topicRef'];
+  const topicQuery = typeof input['topicQuery'] === 'string' ? input['topicQuery'].trim() : '';
+
+  let selectedTopic: EntityCandidate | null = null;
+  let ambiguousTopics: EntityCandidate[] = [];
+
+  if (isRef(topicRefRaw)) {
+    const built = await buildEntityCandidate(ctx.store, topicRefRaw, 20);
+    if (built !== null) {
+      selectedTopic = built.candidate;
+    }
+  } else if (topicQuery !== '') {
+    const roles: ConsRole[] = ['object', 'concept'];
+    const pool = new Map<string, SearchResultItem>();
+    const mentioned = await ctx.store.findMentionedCons(topicQuery, roles, {
+      excludeInputProvenance: true,
+      limit: 30,
+    });
+    for (const m of mentioned) pool.set(m.ref.consId, m);
+    const searched = await searchCore(ctx.store, [{ text: topicQuery, roles }], {
+      limit: 30,
+      excludeInputProvenance: true,
+    });
+    for (const s of searched) {
+      const prev = pool.get(s.ref.consId);
+      if (prev === undefined || CHANNEL_ORDER[s.channel] > CHANNEL_ORDER[prev.channel]) {
+        pool.set(s.ref.consId, s);
+      }
+    }
+
+    const candidates: EntityCandidate[] = [];
+    for (const item of pool.values()) {
+      const built = await buildEntityCandidate(ctx.store, item.ref, 10);
+      if (built !== null) candidates.push(built.candidate);
+    }
+
+    // Prefer exact title/alias matches against the query (or longest mentioned title inside the query).
+    const qLower = topicQuery.toLowerCase();
+    const exactMatches = candidates.filter(
+      (c) => c.title.trim().toLowerCase() === qLower
+        || c.aliases.some((a) => a.trim().toLowerCase() === qLower),
+    );
+    const mentionedMatches = exactMatches.length > 0
+      ? exactMatches
+      : candidates.filter(
+          (c) => (c.title.trim().length >= 2 && qLower.includes(c.title.trim().toLowerCase()))
+            || c.aliases.some((a) => a.trim().length >= 2 && qLower.includes(a.trim().toLowerCase())),
+        );
+
+    let narrowed = mentionedMatches.length > 0 ? mentionedMatches : candidates;
+    if (narrowed.length > 1) {
+      // Group by normalized title; if the top matched title has multiple distinct cons
+      // (e.g., three separate "屠天勤" entities in a legacy DB), refuse to merge them silently.
+      const maxTitleLen = Math.max(...narrowed.map((c) => c.title.trim().length));
+      const longestGroup = narrowed.filter((c) => c.title.trim().length === maxTitleLen);
+      const uniqueTitles = new Set(longestGroup.map((c) => c.title.trim().toLowerCase()));
+      if (uniqueTitles.size === 1 && longestGroup.length > 1) {
+        narrowed = longestGroup;
+      }
+    }
+
+    if (narrowed.length === 1 && narrowed[0] !== undefined) {
+      selectedTopic = narrowed[0];
+    } else if (narrowed.length > 1) {
+      ambiguousTopics = narrowed;
+    }
+  }
+
+  if (ambiguousTopics.length > 0) {
+    const snap: TrustedSummaryContextSnapshot = {
+      status: 'needs_resolution',
+      topicRef: null,
+      ambiguousTopicRefs: ambiguousTopics.map((t) => t.ref),
+      allowedSourceRefs: [],
+    };
+    await ctx.store.putTrustedSnapshot(ctx.run.id, TRUSTED_SNAPSHOT_SUMMARY_CONTEXT, ctx.step.id, snap);
+    await ctx.store.appendEvent(
+      'retrieval_performed',
+      { mode: 'topic_summary', status: 'needs_resolution', ambiguousTopicRefs: snap.ambiguousTopicRefs },
+      ctx.run.id,
+      ctx.step.id,
+    );
+    return {
+      status: 'needs_resolution',
+      topic: null,
+      ambiguousTopics,
+      directStatements: [],
+      relatedContextStatements: [],
+      allowedSourceRefs: [],
+      truncated: false,
+    };
+  }
+
+  if (selectedTopic === null) {
+    const snap: TrustedSummaryContextSnapshot = {
+      status: 'no_topic',
+      topicRef: null,
+      ambiguousTopicRefs: [],
+      allowedSourceRefs: [],
+    };
+    await ctx.store.putTrustedSnapshot(ctx.run.id, TRUSTED_SNAPSHOT_SUMMARY_CONTEXT, ctx.step.id, snap);
+    await ctx.store.appendEvent(
+      'retrieval_performed',
+      { mode: 'topic_summary', status: 'no_topic', topicQuery },
+      ctx.run.id,
+      ctx.step.id,
+    );
+    return {
+      status: 'no_topic',
+      topic: null,
+      ambiguousTopics: [],
+      directStatements: [],
+      relatedContextStatements: [],
+      allowedSourceRefs: [],
+      truncated: false,
+    };
+  }
+
+  // Collect one-hop directly linked propositions and directly linked objects for the topic.
+  const directStmtMap = new Map<string, StatementCandidate>();
+  const directObjectRefs = new Map<string, { ref: ConsRef; title: string }>();
+  const topicEdges = await ctx.store.listEdges(selectedTopic.ref.consId, 'both', true);
+  for (const edge of topicEdges) {
+    const otherRef = edge.from.consId === selectedTopic.ref.consId ? edge.to : edge.from;
+    const otherCons = await ctx.store.getCons(otherRef.consId);
+    if (otherCons === null || otherCons.status !== 'active') continue;
+    const otherRev = await ctx.store.getRevision(otherRef.consId, otherRef.revision);
+    if (otherRev === null || otherRev.provenance.source === 'input') continue;
+    if (otherRev.roles.includes('proposition')) {
+      const k = refKey(otherRef);
+      if (!directStmtMap.has(k)) {
+        const sc = await buildStatementCandidate(ctx.store, otherRef);
+        if (sc !== null) directStmtMap.set(k, sc);
+      }
+    } else if (otherRev.roles.includes('object') || otherRev.roles.includes('concept')) {
+      directObjectRefs.set(otherRef.consId, { ref: otherRef, title: otherRev.title });
+    }
+  }
+
+  // Also collect entities co-occurring in the topic's direct statements (e.g. schools).
+  const relatedEntities = new Map<string, { ref: ConsRef; title: string }>(directObjectRefs);
+  for (const stmt of directStmtMap.values()) {
+    for (const ro of stmt.relatedObjects) {
+      if (ro.ref.consId !== selectedTopic.ref.consId) {
+        relatedEntities.set(ro.ref.consId, { ref: ro.ref, title: ro.title });
+      }
+    }
+  }
+
+  // Gather secondary context statements attached to those related entities or their direct components (e.g., canteens part_of school).
+  const secondaryEntities = new Map<string, { ref: ConsRef; title: string; parentTitle?: string }>();
+  for (const ent of relatedEntities.values()) {
+    secondaryEntities.set(ent.ref.consId, { ref: ent.ref, title: ent.title });
+    const entEdges = await ctx.store.listEdges(ent.ref.consId, 'both', true);
+    for (const e of entEdges) {
+      if (e.relationConsId !== REL_PART_OF) continue;
+      const partRef = e.from.consId === ent.ref.consId ? e.to : e.from;
+      if (partRef.consId === selectedTopic.ref.consId || secondaryEntities.has(partRef.consId)) continue;
+      const pCons = await ctx.store.getCons(partRef.consId);
+      if (pCons === null || pCons.status !== 'active') continue;
+      const pRev = await ctx.store.getRevision(partRef.consId, partRef.revision);
+      if (pRev === null || pRev.provenance.source === 'input') continue;
+      if (pRev.roles.includes('object') || pRev.roles.includes('concept')) {
+        secondaryEntities.set(partRef.consId, { ref: partRef, title: pRev.title, parentTitle: ent.title });
+      }
+    }
+  }
+
+  const relatedStmtMap = new Map<string, StatementCandidate & { attachedTo: { ref: ConsRef; title: string }; directlyAboutTopic: false }>();
+  for (const ent of secondaryEntities.values()) {
+    const entEdges = await ctx.store.listEdges(ent.ref.consId, 'both', true);
+    for (const e of entEdges) {
+      const otherRef = e.from.consId === ent.ref.consId ? e.to : e.from;
+      const k = refKey(otherRef);
+      if (directStmtMap.has(k) || relatedStmtMap.has(k)) continue;
+      const sc = await buildStatementCandidate(ctx.store, otherRef);
+      if (sc === null) continue;
+      relatedStmtMap.set(k, {
+        ...sc,
+        attachedTo: { ref: ent.ref, title: ent.title },
+        directlyAboutTopic: false,
+      });
+    }
+  }
+
+  const allDirect = [...directStmtMap.values()].sort((a, b) => (a.ref.consId < b.ref.consId ? -1 : 1));
+  const allRelated = [...relatedStmtMap.values()].sort((a, b) => (a.ref.consId < b.ref.consId ? -1 : 1));
+  const truncated = allDirect.length + allRelated.length > maxStatements;
+  const directStatements = allDirect.slice(0, maxStatements);
+  const remaining = Math.max(0, maxStatements - directStatements.length);
+  const relatedContextStatements = allRelated.slice(0, remaining);
+
+  const allowedSourceMap = new Map<string, ConsRef>();
+  const addAllowedSource = (ref: ConsRef): void => {
+    allowedSourceMap.set(refKey(ref), ref);
+  };
+  for (const s of [...directStatements, ...relatedContextStatements]) {
+    addAllowedSource(s.ref);
+    for (const src of s.sourceRefs) {
+      addAllowedSource(src);
+    }
+  }
+  const allowedSourceRefs = [...allowedSourceMap.values()];
+
+  const snap: TrustedSummaryContextSnapshot = {
+    status: 'ready',
+    topicRef: selectedTopic.ref,
+    ambiguousTopicRefs: [],
+    allowedSourceRefs,
+  };
+  await ctx.store.putTrustedSnapshot(ctx.run.id, TRUSTED_SNAPSHOT_SUMMARY_CONTEXT, ctx.step.id, snap);
+
+  await ctx.store.appendEvent(
+    'retrieval_performed',
+    {
+      mode: 'topic_summary',
+      status: 'ready',
+      topicRef: selectedTopic.ref,
+      directStatementRefs: directStatements.map((s) => s.ref),
+      relatedContextStatementRefs: relatedContextStatements.map((s) => s.ref),
+      allowedSourceRefs,
+      truncated,
+    },
+    ctx.run.id,
+    ctx.step.id,
+  );
+
+  return {
+    status: 'ready',
+    topic: selectedTopic,
+    ambiguousTopics: [],
+    directStatements,
+    relatedContextStatements,
+    allowedSourceRefs,
+    truncated,
+  };
+}
+
 async function searchPrimitive(ctx: StepContext): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
+  const mode = typeof input['mode'] === 'string' ? input['mode'] : 'default';
+  if (mode === 'topic_summary') {
+    return topicSummarySearchMode(ctx, input);
+  }
   const rawQueries = Array.isArray(input['queries']) ? input['queries'] : [];
   const extraRoles = Array.isArray(input['roles']) ? (input['roles'] as ConsRole[]) : undefined;
   const queries: CoreQuery[] = [];
@@ -328,8 +867,11 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
       queries.push(roles === undefined ? { text: q['text'] } : { text: q['text'], roles });
     }
   }
+  if (mode === 'context') {
+    return contextSearchMode(ctx, input, queries);
+  }
   const tendencyScope = input['tendencyScope'];
-  if (tendencyScope === 'action_selection' || tendencyScope === 'method_selection') {
+  if (tendencyScope === 'action_selection' || tendencyScope === 'method_selection' || tendencyScope === 'entity_resolution') {
     return { tendencyRefs: await tendencyCandidatesCore(ctx.store, queries, tendencyScope, input['anchorIds']) };
   }
   if (typeof input['actionId'] === 'string') {
@@ -344,13 +886,22 @@ async function searchPrimitive(ctx: StepContext): Promise<unknown> {
   const limit = typeof input['limit'] === 'number' ? input['limit'] : undefined;
   const anchorIds = Array.isArray(input['anchorIds']) ? input['anchorIds'].filter((v): v is string => typeof v === 'string') : [];
   const anchorQueries: CoreQuery[] = anchorIds.map((id) => ({ text: id, ...(extraRoles === undefined ? {} : { roles: extraRoles }) }));
-  const searchOpts: { limit?: number; coldStartRole?: ConsRole; runId: string; stepId: string; expansionTexts?: string[]; allowedIds?: string[] } = {
+  const searchOpts: {
+    limit?: number;
+    coldStartRole?: ConsRole;
+    runId: string;
+    stepId: string;
+    expansionTexts?: string[];
+    allowedIds?: string[];
+    excludeInputProvenance?: boolean;
+  } = {
     runId: ctx.run.id,
     stepId: ctx.step.id,
   };
   const allowedActionIds = Array.isArray(input['allowedActionIds']) ? input['allowedActionIds'].filter((v): v is string => typeof v === 'string') : [];
   if (allowedActionIds.length > 0) searchOpts.allowedIds = allowedActionIds;
   if (limit !== undefined) searchOpts.limit = limit;
+  if (input['excludeInputProvenance'] === true) searchOpts.excludeInputProvenance = true;
   if (wantsActions) {
     searchOpts.coldStartRole = 'action';
     const inputState = ctx.run.state['input'];
@@ -422,6 +973,8 @@ export function isContentActionCompatible(
     }
   }
   const inputSchema = isRecord(spec['inputSchema']) ? spec['inputSchema'] : {};
+  const inProps = isRecord(inputSchema['properties']) ? inputSchema['properties'] : null;
+  if (inProps !== null && !('input' in inProps) && !('task' in inProps)) return false;
   const probeBase = baseInput ?? { input: {}, task: '' };
   const candidateInput = adaptInputForSchema(inputSchema, probeBase, optionalInput);
   return validateSchema(inputSchema, candidateInput).ok;
@@ -440,9 +993,9 @@ export async function assertTempIdNamespace(store: ConsStoreApi, tempId: string)
 
 const KIND_ROLES: Record<string, ConsRole[]> = {
   object: ['object'],
+  concept: ['concept'],
   proposition: ['proposition'],
   relation_type: ['relation_type'],
-  relation: ['relation_type'],
   method: ['method'],
   tendency: ['tendency'],
   action: ['action'],
@@ -1043,6 +1596,675 @@ async function resolveMainActionId(ctx: StepContext): Promise<string | null> {
   return null;
 }
 
+/**
+ * Create a new active edge or reuse an existing active structural edge with the same
+ * (from, relationConsId, to) triple, appending supporting evidenceRefs without losing
+ * provenance from earlier inputs.
+ */
+async function createOrReuseEdgeInTx(
+  store: ConsStoreApi,
+  from: ConsRef,
+  relationConsId: string,
+  to: ConsRef,
+  stepId: string,
+  evidenceRefs: ConsRef[],
+): Promise<{ edge: ConsEdge; reused: boolean }> {
+  const existing = await store.findActiveEdge(from, relationConsId, to);
+  if (existing !== null) {
+    if (evidenceRefs.length > 0) {
+      await store.addEdgeEvidence(existing.id, evidenceRefs, stepId);
+    }
+    return { edge: existing, reused: true };
+  }
+  const edge = await store.createEdge({
+    from,
+    relationConsId,
+    to,
+    createdByStepId: stepId,
+    status: 'active',
+    ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
+  });
+  return { edge, reused: false };
+}
+
+/**
+ * Verify that an existing ConsRef still refers to an active cons whose active and
+ * current revision match the snapshot revision (no silent upgrade on version drift).
+ */
+async function assertActiveVersionMatch(
+  store: ConsStoreApi,
+  ref: ConsRef,
+  label: string,
+): Promise<ConsRevision> {
+  const cons = await store.getCons(ref.consId);
+  if (cons === null) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: ${label} ${ref.consId} not found`);
+  }
+  if (cons.status !== 'active') {
+    throw new PrimitiveError('invalid_reference', `invalid_reference: ${label} ${ref.consId} is not active`);
+  }
+  if (activeRevisionOf(cons) !== ref.revision || cons.currentRevision !== ref.revision) {
+    throw new PrimitiveError(
+      'revision_conflict',
+      `revision_conflict: ${label} ${ref.consId}@${String(ref.revision)} is stale (active=${String(activeRevisionOf(cons))}, current=${String(cons.currentRevision)})`,
+    );
+  }
+  const rev = await store.getRevision(ref.consId, ref.revision);
+  if (rev === null) {
+    throw new PrimitiveError('unknown_reference', `unknown_reference: ${label} revision ${refKey(ref)} not found`);
+  }
+  return rev;
+}
+
+/**
+ * Controlled single-transaction materialize + connect primitive.
+ *
+ * Handles two modes:
+ * 1. Topic summary mode (`summaryDraft`): validates sourceRefs against the server-trusted
+ *    `summary_context` snapshot, creates a new record cons (or CAS revision when updating),
+ *    activates it, and links it to the topic and source records without modifying originals.
+ * 2. Content batch mode (`artifacts`): validates resolutions against server-trusted
+ *    `entity_context` and `entity_resolution` snapshots, checks candidate versions for drift,
+ *    creates only `create`/proposition/relation_type cons, maps reused tempIds to existing
+ *    ConsRefs without mutating or re-activating reused objects, compiles local links and
+ *    explicit P1 associations, activates newly created cons, deduplicates structural edges
+ *    while preserving per-input evidence, and stores idempotency results atomically.
+ */
+async function materializeAndConnectPrimitive(ctx: StepContext, stepId: string): Promise<unknown> {
+  const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
+  if (input['summaryDraft'] !== undefined) {
+    return materializeSummaryInTx(ctx, stepId, input);
+  }
+  return materializeContentBatchInTx(ctx, stepId, input);
+}
+
+async function materializeSummaryInTx(
+  ctx: StepContext,
+  stepId: string,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const draft = input['summaryDraft'];
+  if (!isRecord(draft)) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: summaryDraft must be an object');
+  }
+  const topicRef = input['topicRef'];
+  if (!isRef(topicRef)) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: topicRef is required for summary materialization');
+  }
+  const title = nonEmptyString(draft['title']);
+  const body = nonEmptyString(draft['body']);
+  if (title === null || body === null) {
+    throw new PrimitiveError('schema_mismatch', 'schema_mismatch: summaryDraft requires non-empty title and body');
+  }
+  const sourceRefs = asRefs(draft['sourceRefs']);
+  const coverage = asStringArray(draft['coverage']);
+  const openQuestions = asStringArray(draft['openQuestions']);
+  const aliases = asStringArray(draft['aliases']);
+  const searchTerms = asStringArray(draft['searchTerms']);
+  const activate = input['activate'] !== false;
+  const updateRaw = input['updateSummaryRef'];
+
+  return ctx.store.transaction(async (): Promise<unknown> => {
+    const saved = await ctx.store.getIdempotencyResult(materializeResultKey(stepId));
+    if (saved !== null) return saved;
+
+    const snap = await ctx.store.getTrustedSnapshot<TrustedSummaryContextSnapshot>(
+      ctx.run.id,
+      TRUSTED_SNAPSHOT_SUMMARY_CONTEXT,
+    );
+    if (snap === null || snap.payload.status !== 'ready' || snap.payload.topicRef === null) {
+      throw new PrimitiveError('unauthorized_effect', 'unauthorized_effect: missing verified summary_context snapshot');
+    }
+    if (refKey(snap.payload.topicRef) !== refKey(topicRef)) {
+      throw new PrimitiveError('invalid_reference', 'invalid_reference: topicRef does not match verified summary_context');
+    }
+    await assertActiveVersionMatch(ctx.store, topicRef, 'summary topic');
+
+    const allowedSources = new Set(snap.payload.allowedSourceRefs.map(refKey));
+    for (const sref of sourceRefs) {
+      if (!allowedSources.has(refKey(sref))) {
+        throw new PrimitiveError(
+          'invalid_reference',
+          `invalid_reference: summary sourceRef ${refKey(sref)} is outside verified summary_context`,
+        );
+      }
+      await assertEndpointRevision(ctx.store, sref, 'summary sourceRef');
+    }
+
+    // Format summary body while preserving explicit coverage and open questions.
+    const sections = [body.trim()];
+    if (coverage.length > 0) {
+      sections.push(`\n覆盖条目：${coverage.join('；')}`);
+    }
+    if (openQuestions.length > 0) {
+      sections.push(`\n待补充/未明确：${openQuestions.join('；')}`);
+    }
+    const fullBody = sections.join('\n');
+
+    let summaryRef: ConsRef;
+    if (isRecord(updateRaw) && typeof updateRaw['consId'] === 'string' && typeof updateRaw['expectedRevision'] === 'number') {
+      const targetId = updateRaw['consId'];
+      const expectedRev = updateRaw['expectedRevision'];
+      const existing = await ctx.store.getCons(targetId);
+      if (existing === null) {
+        throw new PrimitiveError('unknown_reference', `unknown_reference: summary cons ${targetId} not found`);
+      }
+      if (existing.currentRevision !== expectedRev) {
+        throw new PrimitiveError(
+          'revision_conflict',
+          `revision_conflict: summary ${targetId} expected revision ${String(expectedRev)} but current is ${String(existing.currentRevision)}`,
+        );
+      }
+      const created = await ctx.store.createRevision(targetId, {
+        title,
+        roles: ['record'],
+        body: fullBody,
+        aliases,
+        searchTerms: mergeUniqueStrings(searchTerms, ['汇总', title]),
+        provenance: {
+          source: 'llm',
+          runId: ctx.run.id,
+          stepId,
+          sourceRefs,
+        },
+      });
+      summaryRef = { consId: targetId, revision: created.revision };
+    } else {
+      const id = randomUUID();
+      await ctx.store.createCons({
+        consId: id,
+        title,
+        roles: ['record'],
+        body: fullBody,
+        aliases,
+        searchTerms: mergeUniqueStrings(searchTerms, ['汇总', title]),
+        provenance: {
+          source: 'llm',
+          runId: ctx.run.id,
+          stepId,
+          sourceRefs,
+        },
+      });
+      summaryRef = { consId: id, revision: 1 };
+    }
+
+    if (activate) {
+      await activateConsInTx(ctx.store, summaryRef.consId, summaryRef.revision, {
+        activatedBy: stepId,
+        runId: ctx.run.id,
+        stepId,
+      });
+    }
+
+    const edgeIds: string[] = [];
+    const reusedEdgeIds: string[] = [];
+    const descRes = await createOrReuseEdgeInTx(ctx.store, summaryRef, REL_DESCRIBES, topicRef, stepId, sourceRefs);
+    (descRes.reused ? reusedEdgeIds : edgeIds).push(descRes.edge.id);
+
+    for (const sref of sourceRefs) {
+      const srcRes = await createOrReuseEdgeInTx(ctx.store, summaryRef, REL_DERIVED_FROM, sref, stepId, [sref]);
+      (srcRes.reused ? reusedEdgeIds : edgeIds).push(srcRes.edge.id);
+    }
+
+    await ctx.store.appendEvent(
+      'summary_materialized',
+      {
+        summaryRef,
+        topicRef,
+        sourceRefs,
+        coverage,
+        openQuestions,
+      },
+      ctx.run.id,
+      stepId,
+    );
+
+    const out = {
+      connected: [summaryRef],
+      created: [summaryRef],
+      reused: [] as ConsRef[],
+      edges: edgeIds,
+      reusedEdges: reusedEdgeIds,
+      tempMappings: { summary: summaryRef },
+    };
+    await ctx.store.putIdempotencyResult(materializeResultKey(stepId), out);
+    return out;
+  });
+}
+
+async function materializeContentBatchInTx(
+  ctx: StepContext,
+  stepId: string,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const artifacts = Array.isArray(input['artifacts']) ? input['artifacts'] : [];
+  const links = Array.isArray(input['links']) ? input['links'] : [];
+  const associations = Array.isArray(input['associations']) ? input['associations'] : [];
+  const metadataRaw = Array.isArray(input['metadata']) ? input['metadata'] : [];
+  const inputRef = isRef(input['inputRef']) ? input['inputRef'] : null;
+  const activate = input['activate'] !== false;
+  const allowRelationTypeActivation = input['allowRelationTypeActivation'] === true;
+
+  return ctx.store.transaction(async (): Promise<unknown> => {
+    const saved = await ctx.store.getIdempotencyResult(materializeResultKey(stepId));
+    if (saved !== null) return saved;
+
+    // 1. Load server-trusted candidate snapshot and entity resolution authorization.
+    const contextSnap = await ctx.store.getTrustedSnapshot<TrustedEntityContextSnapshot>(
+      ctx.run.id,
+      TRUSTED_SNAPSHOT_ENTITY_CONTEXT,
+    );
+    const resolutionSnap = await ctx.store.getTrustedSnapshot<TrustedEntityResolutionSnapshot>(
+      ctx.run.id,
+      TRUSTED_SNAPSHOT_ENTITY_RESOLUTION,
+    );
+    if (resolutionSnap === null) {
+      throw new PrimitiveError(
+        'unauthorized_effect',
+        'unauthorized_effect: missing verified entity_resolution snapshot for materialize_and_connect',
+      );
+    }
+    if (resolutionSnap.payload.confirmedByHuman !== true) {
+      const resStep = await ctx.store.getStepById(resolutionSnap.stepId);
+      if (resStep === null || resStep.runId !== ctx.run.id || resStep.status !== 'succeeded') {
+        throw new PrimitiveError(
+          'unauthorized_effect',
+          'unauthorized_effect: entity_resolution snapshot does not reference a succeeded step in this run',
+        );
+      }
+    }
+    if (resolutionSnap.payload.unresolvedTempIds.length > 0) {
+      throw new PrimitiveError(
+        'unauthorized_effect',
+        `unauthorized_effect: unresolved entities remain (${resolutionSnap.payload.unresolvedTempIds.join(', ')})`,
+      );
+    }
+
+    const allowedObjectSet = new Set((contextSnap?.payload.objectRefs ?? []).map(refKey));
+    const allowedContextEndpointSet = new Set([
+      ...(contextSnap?.payload.objectRefs ?? []).map(refKey),
+      ...(contextSnap?.payload.statementRefs ?? []).map(refKey),
+    ]);
+    const allowedEvidenceSet = new Set<string>([...allowedContextEndpointSet]);
+    if (inputRef !== null) {
+      allowedEvidenceSet.add(refKey(inputRef));
+    }
+
+    // 2. Validate batch artifacts against resolutions and tempId namespace.
+    const resolutionByTempId = new Map<string, EntityResolutionItem>();
+    for (const r of resolutionSnap.payload.resolutions) {
+      if (resolutionByTempId.has(r.tempId)) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: duplicate resolution for tempId "${r.tempId}"`);
+      }
+      resolutionByTempId.set(r.tempId, r);
+    }
+
+    const seenTempIds = new Set<string>();
+    const reusedTempToRef = new Map<string, ConsRef>();
+    const createArtifacts: Array<{ tempId: string; kind: string; content: Record<string, unknown> }> = [];
+
+    for (const raw of artifacts) {
+      if (!isRecord(raw)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: artifact item must be an object');
+      }
+      const tempId = nonEmptyString(raw['tempId']);
+      if (tempId === null) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: artifact tempId must be a non-empty string');
+      }
+      if (seenTempIds.has(tempId)) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: duplicate tempId "${tempId}" in batch`);
+      }
+      seenTempIds.add(tempId);
+      await assertTempIdNamespace(ctx.store, tempId);
+
+      const kind = asString(raw['kind'], '');
+      const roles = KIND_ROLES[kind];
+      if (roles === undefined) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: unsupported artifact kind "${kind}"`);
+      }
+      const content = isRecord(raw['content']) ? raw['content'] : {};
+
+      if (kind === 'object' || kind === 'concept') {
+        const res = resolutionByTempId.get(tempId);
+        if (res === undefined) {
+          throw new PrimitiveError(
+            'unauthorized_effect',
+            `unauthorized_effect: entity artifact "${tempId}" has no verified resolution decision`,
+          );
+        }
+        if (res.decision === 'unresolved') {
+          throw new PrimitiveError('unauthorized_effect', `unauthorized_effect: entity "${tempId}" is unresolved`);
+        }
+        if (res.decision === 'reuse') {
+          if (!isRef(res.existingRef)) {
+            throw new PrimitiveError('schema_mismatch', `schema_mismatch: reuse resolution for "${tempId}" missing existingRef`);
+          }
+          if (!allowedObjectSet.has(refKey(res.existingRef))) {
+            throw new PrimitiveError(
+              'invalid_reference',
+              `invalid_reference: reused ref ${refKey(res.existingRef)} for "${tempId}" is outside the verified candidate set`,
+            );
+          }
+          // Ensure candidate revision has not drifted since retrieval.
+          await assertActiveVersionMatch(ctx.store, res.existingRef, `reused entity "${tempId}"`);
+          reusedTempToRef.set(tempId, res.existingRef);
+          continue;
+        }
+      }
+      createArtifacts.push({ tempId, kind, content });
+    }
+
+    // Ensure no stray resolution references an unknown tempId.
+    for (const tid of resolutionByTempId.keys()) {
+      if (!seenTempIds.has(tid)) {
+        throw new PrimitiveError('invalid_reference', `invalid_reference: resolution tempId "${tid}" not found in artifacts`);
+      }
+    }
+
+    // 3. Validate metadata applies ONLY to create items (never mutates reused objects).
+    const metadataMap = new Map<string, { aliases: string[]; searchTerms: string[]; applicabilityText?: string }>();
+    for (const m of metadataRaw) {
+      if (!isRecord(m) || typeof m['tempId'] !== 'string' || m['tempId'].trim() === '') continue;
+      const tid = m['tempId'];
+      if (reusedTempToRef.has(tid)) {
+        throw new PrimitiveError(
+          'unauthorized_effect',
+          `unauthorized_effect: metadata must not target reused entity "${tid}"`,
+        );
+      }
+      const entry: { aliases: string[]; searchTerms: string[]; applicabilityText?: string } = {
+        aliases: asStringArray(m['aliases']),
+        searchTerms: asStringArray(m['searchTerms']),
+      };
+      if (typeof m['applicabilityText'] === 'string' && m['applicabilityText'].trim() !== '') {
+        entry.applicabilityText = m['applicabilityText'];
+      }
+      metadataMap.set(tid, entry);
+    }
+
+    // 4. Form only the newly created items inside this transaction.
+    const tempMap = new Map<string, ConsRef>(reusedTempToRef);
+    const createdItems: Array<{ tempId: string; consRef: ConsRef; roles: ConsRole[] }> = [];
+    const relationTypeDrafts: Array<{ tempId: string; consRef: ConsRef }> = [];
+    const createdRolesById = new Map<string, ConsRole[]>();
+
+    for (const item of createArtifacts) {
+      const title = nonEmptyString(item.content['title']);
+      if (title === null) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: candidate "${item.tempId}" missing content.title`);
+      }
+      const rawBody = nonEmptyString(item.content['body']);
+      if (rawBody === null) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: candidate "${item.tempId}" missing content.body`);
+      }
+      const roles = KIND_ROLES[item.kind] ?? ['object'];
+      if (activate && roles.includes('relation_type') && !allowRelationTypeActivation) {
+        throw new PrimitiveError(
+          'unauthorized_effect',
+          'unauthorized_effect: activating new relation_type drafts requires explicit flow authorization',
+        );
+      }
+      const meta = metadataMap.get(item.tempId);
+      const aliases = mergeUniqueStrings(asStringArray(item.content['aliases']), meta?.aliases ?? []);
+      const searchTerms = mergeUniqueStrings(asStringArray(item.content['searchTerms']), meta?.searchTerms ?? []);
+      const sourceRefs = mergeRefLists(asRefs(item.content['sourceRefs']), inputRef !== null ? [inputRef] : []);
+      const id = randomUUID();
+      const revInput: Omit<ConsRevision, 'revision' | 'createdAt'> = {
+        consId: id,
+        title,
+        roles,
+        body: rawBody,
+        aliases,
+        searchTerms,
+        provenance: {
+          source: 'llm',
+          runId: ctx.run.id,
+          stepId,
+          sourceRefs,
+        },
+      };
+      if (typeof item.content['applicabilityText'] === 'string' && item.content['applicabilityText'].trim() !== '') {
+        revInput.applicabilityText = item.content['applicabilityText'];
+      } else if (meta?.applicabilityText !== undefined) {
+        revInput.applicabilityText = meta.applicabilityText;
+      }
+      await ctx.store.createCons(revInput);
+      const consRef: ConsRef = { consId: id, revision: 1 };
+      tempMap.set(item.tempId, consRef);
+      createdItems.push({ tempId: item.tempId, consRef, roles });
+      createdRolesById.set(consRef.consId, roles);
+      if (roles.includes('relation_type')) {
+        relationTypeDrafts.push({ tempId: item.tempId, consRef });
+      }
+    }
+
+    // 5. Helper to resolve & validate relation target (separated from endpoint checks).
+    const resolveRelation = async (relSpec: unknown): Promise<string> => {
+      if (!isRecord(relSpec)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: edge requires relation object');
+      }
+      const kind = relSpec['kind'];
+      if (kind === 'existing') {
+        if (relSpec['tempId'] !== undefined || !isRef(relSpec['ref'])) {
+          throw new PrimitiveError('schema_mismatch', 'schema_mismatch: existing relation requires ref without tempId');
+        }
+        const relRef = relSpec['ref'];
+        const relRev = await assertActiveVersionMatch(ctx.store, relRef, 'relation_type');
+        if (!relRev.roles.includes('relation_type')) {
+          throw new PrimitiveError(
+            'unauthorized_effect',
+            `unauthorized_effect: relation ${refKey(relRef)} is not an active relation_type`,
+          );
+        }
+        return relRef.consId;
+      }
+      if (kind === 'draft') {
+        if (relSpec['ref'] !== undefined || typeof relSpec['tempId'] !== 'string' || relSpec['tempId'].trim() === '') {
+          throw new PrimitiveError('schema_mismatch', 'schema_mismatch: draft relation requires tempId without ref');
+        }
+        if (!activate || !allowRelationTypeActivation) {
+          throw new PrimitiveError(
+            'unauthorized_effect',
+            'unauthorized_effect: referencing a draft relation_type requires explicit flow authorization',
+          );
+        }
+        const draftRef = tempMap.get(relSpec['tempId']);
+        if (draftRef === undefined) {
+          throw new PrimitiveError('unknown_reference', `draft relation tempId "${relSpec['tempId']}" not found in batch`);
+        }
+        const roles = createdRolesById.get(draftRef.consId);
+        if (roles === undefined || !roles.includes('relation_type')) {
+          throw new PrimitiveError(
+            'unauthorized_effect',
+            `unauthorized_effect: draft tempId "${relSpec['tempId']}" is not a relation_type`,
+          );
+        }
+        return draftRef.consId;
+      }
+      throw new PrimitiveError('schema_mismatch', `schema_mismatch: unsupported relation kind "${String(kind)}"`);
+    };
+
+    // 6. Plan local content links (fromTempId / toTempId mapped via tempMap, including reused refs).
+    const plannedEdges: Array<{ from: ConsRef; to: ConsRef; relationConsId: string; evidenceRefs: ConsRef[] }> = [];
+    const defaultEvidence = inputRef !== null ? [inputRef] : [];
+
+    for (const e of links) {
+      if (!isRecord(e)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: link item must be an object');
+      }
+      const fromTemp = e['fromTempId'];
+      const toTemp = e['toTempId'];
+      if (typeof fromTemp !== 'string' || typeof toTemp !== 'string') {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: local link requires fromTempId and toTempId');
+      }
+      const from = tempMap.get(fromTemp) ?? null;
+      const to = tempMap.get(toTemp) ?? null;
+      if (from === null || to === null) {
+        throw new PrimitiveError('unknown_reference', `unknown_reference: local link endpoint (${fromTemp} -> ${toTemp}) unresolved`);
+      }
+      const relationConsId = await resolveRelation(e['relation']);
+      plannedEdges.push({ from, to, relationConsId, evidenceRefs: defaultEvidence });
+    }
+
+    // 7. Plan explicit P1 cross-input associations (explicit draft/existing union endpoints + evidenceRefs).
+    const resolveExplicitEndpoint = async (ep: unknown, label: string): Promise<ConsRef> => {
+      if (!isRecord(ep)) {
+        throw new PrimitiveError('schema_mismatch', `schema_mismatch: association ${label} must be an object`);
+      }
+      const kind = ep['kind'];
+      if (kind === 'draft') {
+        if (ep['ref'] !== undefined || typeof ep['tempId'] !== 'string' || ep['tempId'].trim() === '') {
+          throw new PrimitiveError('schema_mismatch', `schema_mismatch: draft ${label} requires tempId without ref`);
+        }
+        const mapped = tempMap.get(ep['tempId']);
+        if (mapped === undefined) {
+          throw new PrimitiveError('invalid_reference', `invalid_reference: draft ${label} tempId "${ep['tempId']}" not in batch`);
+        }
+        return mapped;
+      }
+      if (kind === 'existing') {
+        if (ep['tempId'] !== undefined || !isRef(ep['ref'])) {
+          throw new PrimitiveError('schema_mismatch', `schema_mismatch: existing ${label} requires ref without tempId`);
+        }
+        if (!allowedContextEndpointSet.has(refKey(ep['ref']))) {
+          throw new PrimitiveError(
+            'invalid_reference',
+            `invalid_reference: existing ${label} ${refKey(ep['ref'])} is outside the verified context snapshot`,
+          );
+        }
+        await assertActiveVersionMatch(ctx.store, ep['ref'], `association ${label}`);
+        return ep['ref'];
+      }
+      throw new PrimitiveError('schema_mismatch', `schema_mismatch: unsupported endpoint kind "${String(kind)}"`);
+    };
+
+    for (const assoc of associations) {
+      if (!isRecord(assoc)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: association item must be an object');
+      }
+      const from = await resolveExplicitEndpoint(assoc['from'], 'from');
+      const to = await resolveExplicitEndpoint(assoc['to'], 'to');
+      if (refKey(from) === refKey(to)) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: association must not form a self-loop');
+      }
+      const relationConsId = await resolveRelation(assoc['relation']);
+      const evRefs = asRefs(assoc['evidenceRefs']);
+      if (evRefs.length === 0) {
+        throw new PrimitiveError('schema_mismatch', 'schema_mismatch: association requires non-empty evidenceRefs');
+      }
+      for (const ev of evRefs) {
+        if (!allowedEvidenceSet.has(refKey(ev))) {
+          throw new PrimitiveError(
+            'invalid_reference',
+            `invalid_reference: association evidenceRef ${refKey(ev)} is outside the authorized evidence set`,
+          );
+        }
+        await assertEndpointRevision(ctx.store, ev, 'association evidenceRef');
+      }
+      const mergedEvidence = mergeRefLists(evRefs, defaultEvidence);
+      plannedEdges.push({ from, to, relationConsId, evidenceRefs: mergedEvidence });
+    }
+
+    // 8. Activate ONLY newly created relation types first, then create/reuse edges, then activate remaining new cons.
+    // Reused objects are NEVER modified or re-activated.
+    if (activate && allowRelationTypeActivation) {
+      for (const f of relationTypeDrafts) {
+        await activateConsInTx(ctx.store, f.consRef.consId, f.consRef.revision, {
+          activatedBy: stepId,
+          runId: ctx.run.id,
+          stepId,
+        });
+      }
+    }
+
+    const edgeIds: string[] = [];
+    const reusedEdgeIds: string[] = [];
+    const createdEdgeRefs: Array<{ id: string; from: ConsRef; relationConsId: string; to: ConsRef; reused: boolean }> = [];
+    for (const pe of plannedEdges) {
+      const relCons = await ctx.store.getCons(pe.relationConsId);
+      const relRev = relCons !== null ? await ctx.store.getRevision(relCons.id, activeRevisionOf(relCons)) : null;
+      if (relCons === null || relCons.status !== 'active' || relRev === null || !relRev.roles.includes('relation_type')) {
+        throw new PrimitiveError(
+          'unauthorized_effect',
+          `unauthorized_effect: relation cons ${pe.relationConsId} is not an active relation_type`,
+        );
+      }
+      const res = await createOrReuseEdgeInTx(ctx.store, pe.from, pe.relationConsId, pe.to, stepId, pe.evidenceRefs);
+      if (res.reused) {
+        if (!reusedEdgeIds.includes(res.edge.id)) reusedEdgeIds.push(res.edge.id);
+      } else {
+        edgeIds.push(res.edge.id);
+      }
+      createdEdgeRefs.push({
+        id: res.edge.id,
+        from: pe.from,
+        relationConsId: pe.relationConsId,
+        to: pe.to,
+        reused: res.reused,
+      });
+    }
+
+    if (activate) {
+      for (const item of createdItems) {
+        if (item.roles.includes('relation_type')) continue;
+        await activateConsInTx(ctx.store, item.consRef.consId, item.consRef.revision, {
+          activatedBy: stepId,
+          runId: ctx.run.id,
+          stepId,
+        });
+      }
+    }
+
+    const createdRefs = createdItems.map((c) => c.consRef);
+    const reusedRefs = [...reusedTempToRef.values()];
+    const tempMappings: Record<string, ConsRef> = {};
+    for (const [k, v] of tempMap.entries()) {
+      tempMappings[k] = v;
+    }
+
+    if (createdEdgeRefs.length > 0) {
+      await ctx.store.appendEvent('edges_created', { edges: createdEdgeRefs }, ctx.run.id, stepId);
+    }
+    await ctx.store.appendEvent(
+      'entities_materialized',
+      {
+        createdCount: createdRefs.length,
+        reusedCount: reusedRefs.length,
+        createdRefs,
+        reusedRefs,
+        tempMappings,
+        edgesCreated: edgeIds.length,
+        edgesReused: reusedEdgeIds.length,
+      },
+      ctx.run.id,
+      stepId,
+    );
+
+    const out = {
+      connected: createdRefs,
+      created: createdRefs,
+      reused: reusedRefs,
+      edges: edgeIds,
+      reusedEdges: reusedEdgeIds,
+      tempMappings,
+    };
+    await ctx.store.putIdempotencyResult(materializeResultKey(stepId), out);
+    return out;
+  });
+}
+
+function mergeRefLists(a: ConsRef[], b: ConsRef[]): ConsRef[] {
+  const seen = new Set<string>();
+  const out: ConsRef[] = [];
+  for (const ref of [...a, ...b]) {
+    const k = refKey(ref);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(ref);
+  }
+  return out;
+}
+
 async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unknown> {
   const input = isRecord(ctx.envelope.input) ? ctx.envelope.input : {};
   const formedRaw = Array.isArray(input['formed']) ? input['formed'] : [];
@@ -1226,15 +2448,11 @@ async function connectPrimitive(ctx: StepContext, stepId: string): Promise<unkno
           `unauthorized_effect: relation cons ${pe.relationConsId} is not an active relation_type`,
         );
       }
-      const edge = await ctx.store.createEdge({
-        from: pe.from,
-        relationConsId: pe.relationConsId,
-        to: pe.to,
-        createdByStepId: stepId,
-        status: 'active',
-      });
-      edgeIds.push(edge.id);
-      createdEdgeRefs.push({ id: edge.id, from: pe.from, relationConsId: pe.relationConsId, to: pe.to });
+      const res = await createOrReuseEdgeInTx(ctx.store, pe.from, pe.relationConsId, pe.to, stepId, []);
+      if (!res.reused) {
+        edgeIds.push(res.edge.id);
+        createdEdgeRefs.push({ id: res.edge.id, from: pe.from, relationConsId: pe.relationConsId, to: pe.to });
+      }
     }
 
     for (const pb of plannedBindings) {
@@ -1340,11 +2558,23 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
     selectedAction === null
       ? undefined
       : steps.find((s) => s.actionRef.consId === selectedAction.consId && s.actionRef.revision === selectedAction.revision);
-  const connectStep = byAction('seed.connect');
+  const connectStep = byAction('seed.materialize_and_connect') ?? byAction('seed.connect');
+  const resolveStep = byAction('seed.resolve_entities');
+  const associateStep = byAction('seed.associate_context');
+  const contextStep = steps.find((s) => s.nodeId === 'retrieve_context');
   const receiveOut = outputOf(receiveStep);
   const inputRef = receiveOut !== null && isRef(receiveOut['consRef']) ? receiveOut['consRef'] : null;
   const connectOut = outputOf(connectStep);
   const artifactRefs = connectOut !== null && Array.isArray(connectOut['connected']) ? asRefs(connectOut['connected']) : [];
+  const reusedRefs = connectOut !== null && Array.isArray(connectOut['reused']) ? asRefs(connectOut['reused']) : [];
+  const resolveOut = outputOf(resolveStep);
+  const resolutions = resolveOut !== null && Array.isArray(resolveOut['resolutions']) ? resolveOut['resolutions'] : [];
+  const associateOut = outputOf(associateStep);
+  const associations = associateOut !== null && Array.isArray(associateOut['associations']) ? associateOut['associations'] : [];
+  const contextOut = outputOf(contextStep);
+  const retrievedObjectRefs = contextOut !== null && Array.isArray(contextOut['objects'])
+    ? contextOut['objects'].filter((o): o is { ref: ConsRef } => isRecord(o) && isRef(o['ref'])).map((o) => o.ref)
+    : [];
   const execOut = outputOf(execStep);
   const tendencyIds: string[] = [];
   for (const sel of [actionSel, methodSel]) {
@@ -1395,6 +2625,12 @@ async function recordPrimitive(ctx: StepContext): Promise<unknown> {
     usedTendencies,
     usedDefaultFreedom,
     artifactRefs,
+    reusedRefs,
+    createdCount: artifactRefs.length,
+    reusedCount: reusedRefs.length,
+    retrievedObjectRefs,
+    resolutions,
+    associationsCount: associations.length,
     artifacts: artifactDetails,
     executionSummary,
   };
@@ -1510,6 +2746,9 @@ export function createPrimitives(): Record<string, { run: PrimitiveFn }> {
     search: { run: (ctx: StepContext): Promise<unknown> => searchPrimitive(ctx) },
     form: { run: (ctx: StepContext): Promise<unknown> => formPrimitive(ctx) },
     connect: { run: (ctx: StepContext, stepId: string): Promise<unknown> => connectPrimitive(ctx, stepId) },
+    materialize_and_connect: {
+      run: (ctx: StepContext, stepId: string): Promise<unknown> => materializeAndConnectPrimitive(ctx, stepId),
+    },
     record: { run: (ctx: StepContext): Promise<unknown> => recordPrimitive(ctx) },
     revise: { run: (ctx: StepContext): Promise<unknown> => revisePrimitive(ctx) },
   };

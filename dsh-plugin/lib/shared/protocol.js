@@ -8,6 +8,8 @@ export const ASSET_BASE = 'api/mindspace/assets'
 export const ROUTES = Object.freeze({
   state: `${ROUTE_BASE}/state`,
   ingest: `${ROUTE_BASE}/ingest`,
+  resolve: `${ROUTE_BASE}/resolve`,
+  summarize: `${ROUTE_BASE}/summarize`,
   layout: `${ROUTE_BASE}/layout`,
   models: `${ROUTE_BASE}/models`,
   stream: `${ROUTE_BASE}/stream`,

@@ -774,6 +774,14 @@ export function createPanel({ React, require, ctx }) {
         )
       }
       if (lastFinished) {
+        if (lastFinished.status === 'needs_resolution') {
+          return h(
+            'div',
+            { className: 'dsh-ms-status-left' },
+            h('span', { className: 'dsh-ms-dot warn' }),
+            h('span', null, `检测到歧义对象，本批内容未激活（run: ${lastFinished.runId?.slice(0, 8) || ''}，需显式确认后提交）`),
+          )
+        }
         if (lastFinished.status === 'failed') {
           return h(
             'div',
@@ -782,10 +790,12 @@ export function createPanel({ React, require, ctx }) {
           )
         }
         const newIds = lastFinished.newNodeIds ?? []
+        const reusedIds = lastFinished.reusedNodeIds ?? []
+        const reusedText = reusedIds.length > 0 ? `，复用 ${reusedIds.length} 个已有对象` : ''
         return h(
           'div',
           { className: 'dsh-ms-status-left dsh-ms-status-ok' },
-          h('span', null, `最近一次 ingest 已完成，新增 ${newIds.length} 个节点`),
+          h('span', null, `最近一次 ingest 已完成，新增 ${newIds.length} 个节点${reusedText}`),
           newIds.length > 0
             ? h(
                 'button',

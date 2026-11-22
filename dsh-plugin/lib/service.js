@@ -1,7 +1,28 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { createApp } from '../../dist/app.js'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { createApp as fallbackCreateApp } from '../../dist/app.js'
+
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const ENGINE_BUNDLE_PATH = path.join(HERE, 'vendor', 'mindspace-engine.mjs')
+
+/**
+ * Load the Mindspace engine entry. When a single-file vendor bundle exists, import it
+ * with an mtime cache-buster so toggling the DSH plugin picks up freshly rebuilt dist
+ * without requiring a full DSH host restart; otherwise fall back to ../../dist/app.js.
+ */
+async function loadCreateApp() {
+  try {
+    const info = await stat(ENGINE_BUNDLE_PATH)
+    const mod = await import(`${pathToFileURL(ENGINE_BUNDLE_PATH).href}?v=${String(Math.floor(info.mtimeMs))}`)
+    if (typeof mod.createApp === 'function') {
+      return mod.createApp
+    }
+  } catch {
+  }
+  return fallbackCreateApp
+}
 
 async function writeJsonAtomic(filePath, data) {
   await mkdir(path.dirname(filePath), { recursive: true })
@@ -63,18 +84,28 @@ export function createMindspaceService({ dbPath, llmBridge, logger }) {
       appPromise = (async () => {
         await mkdir(dataDir, { recursive: true })
         await ensureLayout()
+        const createApp = await loadCreateApp()
         const app = await createApp({ dbPath, llm: llmBridge.adapter })
         appInstance = app
         unsubEvents = app.store.subscribeEvents((ev) => {
           if (activeJob === null) return
-          if (ev.eventType === 'step_started' || ev.eventType === 'step_finished' || ev.eventType === 'step_failed' || ev.eventType === 'llm_repair_requested') {
+          if (
+            ev.eventType === 'step_started' ||
+            ev.eventType === 'step_succeeded' ||
+            ev.eventType === 'step_finished' ||
+            ev.eventType === 'step_failed' ||
+            ev.eventType === 'llm_repair_requested'
+          ) {
             const payload = ev.payload && typeof ev.payload === 'object' ? ev.payload : {}
             activeJob.runId = ev.runId ?? activeJob.runId
             activeJob.currentNode = typeof payload.nodeId === 'string' ? payload.nodeId : activeJob.currentNode
-            activeJob.currentAction = typeof payload.actionId === 'string' ? payload.actionId : activeJob.currentAction
+            const actionId = typeof payload.actionId === 'string'
+              ? payload.actionId
+              : (payload.actionRef && typeof payload.actionRef.consId === 'string' ? payload.actionRef.consId : null)
+            activeJob.currentAction = actionId ?? activeJob.currentAction
             activeJob.lastEvent = ev.eventType
             activeJob.updatedAt = ev.createdAt
-            if (ev.eventType === 'step_finished') {
+            if (ev.eventType === 'step_succeeded' || ev.eventType === 'step_finished') {
               activeJob.completedSteps = (activeJob.completedSteps ?? 0) + 1
             }
             broadcast({
@@ -84,7 +115,7 @@ export function createMindspaceService({ dbPath, llmBridge, logger }) {
               event: {
                 type: ev.eventType,
                 nodeId: payload.nodeId ?? null,
-                actionId: payload.actionId ?? null,
+                actionId: activeJob.currentAction ?? null,
                 errorCode: payload.errorCode ?? null,
               },
             })
@@ -135,11 +166,18 @@ export function createMindspaceService({ dbPath, llmBridge, logger }) {
           const run = await app.runIngest(job.text)
           const after = await app.store.getGraphSnapshot()
           const newNodeIds = after.nodes.filter((n) => !beforeIds.has(n.id)).map((n) => n.id)
+          const reusedRefs = run.state?.connectedContent?.reused
+          const reusedNodeIds = Array.isArray(reusedRefs) ? reusedRefs.map((r) => r.consId).filter(Boolean) : []
           activeJob.runId = run.id
-          activeJob.status = run.status === 'completed' ? 'completed' : 'failed'
+          activeJob.status = run.status === 'completed'
+            ? 'completed'
+            : (run.status === 'needs_resolution' ? 'needs_resolution' : 'failed')
           activeJob.finishedAt = new Date().toISOString()
           activeJob.newNodeIds = newNodeIds
-          if (run.status !== 'completed') {
+          activeJob.reusedNodeIds = reusedNodeIds
+          if (run.status === 'needs_resolution') {
+            activeJob.pendingResolution = run.state?.pendingResolution ?? null
+          } else if (run.status !== 'completed') {
             const steps = await app.store.listSteps(run.id)
             const failedStep = [...steps].reverse().find((s) => s.status === 'failed')
             activeJob.error = failedStep?.errorCode ?? `run ${run.status}`
@@ -284,10 +322,60 @@ export function createMindspaceService({ dbPath, llmBridge, logger }) {
     }
   }
 
+  async function resumeResolution(runId, decisions) {
+    const app = await ensureApp()
+    const run = await app.resumeResolution(runId, decisions)
+    const graph = await app.store.getGraphSnapshot()
+    broadcast({
+      frame: 'graph-updated',
+      graph,
+      layout: positions,
+      job: {
+        id: run.id,
+        runId: run.id,
+        status: run.status,
+        finishedAt: new Date().toISOString(),
+        newNodeIds: [],
+      },
+      queuedCount: queue.length,
+      recentJobs: recentJobs.slice(0, 10),
+    })
+    return run
+  }
+
+  async function summarizeTopic(input) {
+    const modelState = await llmBridge.describeState()
+    if (!modelState.ready) {
+      const err = new Error('模型尚未配置完成，请先在右上角「模型配置」中选择或填写模型')
+      err.code = 'model-not-configured'
+      throw err
+    }
+    const app = await ensureApp()
+    const run = await app.summarizeTopic(input)
+    const graph = await app.store.getGraphSnapshot()
+    broadcast({
+      frame: 'graph-updated',
+      graph,
+      layout: positions,
+      job: {
+        id: run.id,
+        runId: run.id,
+        status: run.status,
+        finishedAt: new Date().toISOString(),
+        newNodeIds: [],
+      },
+      queuedCount: queue.length,
+      recentJobs: recentJobs.slice(0, 10),
+    })
+    return run
+  }
+
   return {
     ready: ensureApp,
     getState,
     enqueueIngest,
+    resumeResolution,
+    summarizeTopic,
     saveLayout,
     updateModelConfig,
     describeModels: () => llmBridge.describeState(),

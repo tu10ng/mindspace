@@ -56,17 +56,29 @@ function ingestHandler(selectedAction: string): (req: LlmRequest) => unknown {
     }
     if (action === selectedAction || action === 'seed.decompose') {
       return {
-        artifacts: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象' } }],
+        artifacts: [{ tempId: 'a1', kind: 'object', content: { title: '中心对象', body: '语料中的中心对象。' } }],
         links: [],
         executionSummary: 'mock 拆解',
       };
+    }
+    if (action === 'seed.resolve_entities') {
+      const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
+      const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
+      return {
+        status: 'resolved',
+        resolutions: artifacts
+          .filter((a) => a['kind'] === 'object' || a['kind'] === 'concept')
+          .map((a) => ({ tempId: String(a['tempId'] ?? ''), decision: 'create', basis: 'mock create' })),
+      };
+    }
+    if (action === 'seed.associate_context') {
+      return { associations: [] };
     }
     if (action === 'seed.prepare_connections') {
       const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
       const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
       return {
-        candidates: artifacts.map((a) => ({ tempId: a['tempId'], kind: a['kind'], content: a['content'] })),
-        edges: [],
+        metadata: artifacts.map((a) => ({ tempId: String(a['tempId'] ?? ''), aliases: [], searchTerms: ['对象'] })),
       };
     }
     if (action === 'seed.extract_method') {

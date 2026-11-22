@@ -37,17 +37,21 @@ describe('seed catalog', () => {
     }
   });
 
-  it('contains the full §6 inventory', () => {
-    expect(PRIMITIVE_ACTION_SEEDS.length).toBe(6);
-    expect(LLM_ACTION_SEEDS.length).toBe(10);
+  it('contains the full inventory including P0/P1/P2 linking and summary seeds', () => {
+    expect(PRIMITIVE_ACTION_SEEDS.length).toBe(7);
+    expect(LLM_ACTION_SEEDS.length).toBe(13);
     expect(RELATION_TYPE_SEEDS.length).toBeGreaterThanOrEqual(8);
-    expect(TENDENCY_SEEDS.length).toBe(1);
-    expect(FLOW_SEEDS.length).toBe(4);
-    expect(DEFAULT_METHOD_SEEDS.length).toBe(16);
+    expect(TENDENCY_SEEDS.length).toBe(2);
+    expect(FLOW_SEEDS.length).toBe(5);
+    expect(DEFAULT_METHOD_SEEDS.length).toBe(20);
     const relationIds = RELATION_TYPE_SEEDS.map((r) => r.id);
     for (const required of ['rel.method_of', 'rel.applies_to', 'rel.prefers', 'rel.avoids', 'rel.derived_from', 'rel.used_method', 'rel.used_tendency', 'rel.part_of', 'rel.describes']) {
       expect(relationIds).toContain(required);
     }
+    const llmIds = LLM_ACTION_SEEDS.map((a) => a.id);
+    expect(llmIds).toContain('seed.resolve_entities');
+    expect(llmIds).toContain('seed.associate_context');
+    expect(llmIds).toContain('seed.summarize_topic');
   });
 
   it('binds the six primitives to their primitiveKey', async () => {
@@ -97,11 +101,14 @@ describe('seed catalog', () => {
     }
   });
 
-  it('imports the seed tendency', async () => {
+  it('imports the seed tendencies', async () => {
     const rev = await store.getRevision('tendency.case_before_method');
     expect(rev?.roles).toContain('tendency');
     expect(rev?.spec?.kind).toBe('tendency');
-    expect(await store.countActiveByRole('tendency')).toBe(1);
+    const rev2 = await store.getRevision('tendency.check_existing_objects');
+    expect(rev2?.roles).toContain('tendency');
+    expect(rev2?.spec?.kind).toBe('tendency');
+    expect(await store.countActiveByRole('tendency')).toBe(2);
   });
 });
 

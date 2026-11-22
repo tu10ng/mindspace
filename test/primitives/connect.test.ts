@@ -20,7 +20,13 @@ async function formOne(
   content: Record<string, unknown>,
   tempId = 'x1',
 ): Promise<ConsRef> {
-  const ctx = makeCtx(store, { candidates: [{ tempId, kind, content }] });
+  const normalizedContent: Record<string, unknown> = { ...content };
+  if (typeof normalizedContent['body'] !== 'string' || normalizedContent['body'].trim() === '') {
+    if (kind !== 'method' || typeof normalizedContent['instructions'] !== 'string') {
+      normalizedContent['body'] = `${String(normalizedContent['title'] ?? tempId)} 正文`;
+    }
+  }
+  const ctx = makeCtx(store, { candidates: [{ tempId, kind, content: normalizedContent }] });
   const out = (await createPrimitives()['form']?.run(ctx, ctx.step.id)) as {
     formed: Array<{ tempId: string; consRef: ConsRef }>;
   };

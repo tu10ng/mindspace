@@ -17,6 +17,7 @@ export class FakeStore {
   events: EventRecord[] = [];
   edges: ConsEdge[] = [];
   authorizations: Map<string, RunAuthorization> = new Map();
+  trustedSnapshots: Map<string, { stepId: string; payload: unknown }> = new Map();
   statePatches: Array<Record<string, unknown>> = [];
   private nextEventId = 1;
 
@@ -80,6 +81,38 @@ export class FakeStore {
     const full: ConsEdge = { ...edge, id: `e${String(this.edges.length + 1)}` };
     this.edges.push(full);
     return full;
+  }
+
+  async findActiveEdge(from: ConsRef, relationConsId: string, to: ConsRef): Promise<ConsEdge | null> {
+    return this.edges.find(
+      (e) =>
+        e.status === 'active' &&
+        e.from.consId === from.consId &&
+        e.from.revision === from.revision &&
+        e.relationConsId === relationConsId &&
+        e.to.consId === to.consId &&
+        e.to.revision === to.revision,
+    ) ?? null;
+  }
+
+  async addEdgeEvidence(edgeId: string, evidenceRefs: ConsRef[]): Promise<void> {
+    const edge = this.edges.find((e) => e.id === edgeId);
+    if (edge === undefined) return;
+    const prev = edge.evidenceRefs ?? [];
+    const seen = new Set(prev.map((r) => `${r.consId}@${String(r.revision)}`));
+    const merged = [...prev];
+    for (const ref of evidenceRefs) {
+      const k = `${ref.consId}@${String(ref.revision)}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        merged.push(ref);
+      }
+    }
+    edge.evidenceRefs = merged;
+  }
+
+  async listEdgeEvidence(edgeId: string): Promise<ConsRef[]> {
+    return this.edges.find((e) => e.id === edgeId)?.evidenceRefs ?? [];
   }
 
   async listEdges(consId: string, direction: 'from' | 'to' | 'both' = 'both', onlyActive = true): Promise<ConsEdge[]> {
@@ -200,6 +233,19 @@ export class FakeStore {
 
   async getRunAuthorization(runId: string, key: string): Promise<RunAuthorization | null> {
     return this.authorizations.get(`${runId}::${key}`) ?? null;
+  }
+
+  async putTrustedSnapshot(runId: string, key: string, stepId: string, payload: unknown): Promise<void> {
+    this.trustedSnapshots.set(`${runId}::${key}`, { stepId, payload });
+  }
+
+  async getTrustedSnapshot<T = unknown>(runId: string, key: string): Promise<{ stepId: string; payload: T } | null> {
+    const found = this.trustedSnapshots.get(`${runId}::${key}`);
+    return found === undefined ? null : { stepId: found.stepId, payload: found.payload as T };
+  }
+
+  async findMentionedCons(): Promise<never[]> {
+    return [];
   }
 
   async upsertStep(step: Step): Promise<void> {

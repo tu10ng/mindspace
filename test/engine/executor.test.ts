@@ -48,8 +48,20 @@ const artifactsOutput = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { fromTempId: { type: 'string' }, relationConsId: { type: 'string' }, toTempId: { type: 'string' } },
-        required: ['fromTempId', 'relationConsId', 'toTempId'],
+        properties: {
+          fromTempId: { type: 'string' },
+          relation: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['existing', 'draft'] },
+              ref: { type: 'object', properties: { consId: { type: 'string' }, revision: { type: 'integer' } }, required: ['consId', 'revision'] },
+              tempId: { type: 'string' },
+            },
+            required: ['kind'],
+          },
+          toTempId: { type: 'string' },
+        },
+        required: ['fromTempId', 'relation', 'toTempId'],
       },
     },
     executionSummary: { type: 'string' },
@@ -59,10 +71,10 @@ const artifactsOutput = {
 
 const linkedOutput = {
   artifacts: [
-    { tempId: 'a1', kind: 'object', content: { title: '对象 A' } },
-    { tempId: 'a2', kind: 'proposition', content: { text: '命题' } },
+    { tempId: 'a1', kind: 'object', content: { title: '对象 A', body: '对象 A 正文。' } },
+    { tempId: 'a2', kind: 'proposition', content: { title: '命题', body: '命题正文。' } },
   ],
-  links: [{ fromTempId: 'a2', relationConsId: 'rel.describes', toTempId: 'a1' }],
+  links: [{ fromTempId: 'a2', relation: { kind: 'existing', ref: { consId: 'rel.describes', revision: 1 } }, toTempId: 'a1' }],
   executionSummary: '生成了对象与关系。',
 };
 
@@ -244,7 +256,7 @@ describe('candidate and tendency authorization', () => {
     const run = await executeRun(deps, runId);
     expect(run.status).toBe('failed');
     const selectStep = (await store.listSteps(runId)).find((s) => s.nodeId === 'n_select');
-    expect(selectStep?.errorCode).toBe('unauthorized_action');
+    expect(selectStep?.errorCode).toBe('invalid_reference');
   });
 
   it('accepts usedTendencies drawn from the provided tendencies', async () => {
@@ -276,6 +288,15 @@ describe('repair and retry limits', () => {
     expect(selectStep?.errorCode).toBe('invalid_json');
     expect(llm.calls).toHaveLength(2);
     expect(llm.calls[1]?.userPrompt).toContain('invalid_json');
+  });
+
+  it('accepts valid JSON wrapped in a single markdown json code fence', async () => {
+    const fenced = '```json\n' + JSON.stringify(selectedOutput) + '\n```';
+    const llm = createScriptedLlm([fenced]);
+    const { deps, runId } = await setupHarness(llm);
+    const run = await executeRun(deps, runId);
+    expect(run.status).toBe('completed');
+    expect(llm.calls).toHaveLength(1);
   });
 
   it('recovers when the repair call returns valid output', async () => {
@@ -514,16 +535,16 @@ describe('input validation', () => {
 });
 
 describe('§7.4 allowed relation types', () => {
-  it('rejects links whose relationConsId is not an active relation type with unauthorized_effect', async () => {
+  it('rejects links whose existing relation ref is not in availableRelationTypes with invalid_reference', async () => {
     const llm = createMockLlm(() => linkedOutput);
     const { deps, store, runId } = await setupContentHarness(llm, false);
     const run = await executeRun(deps, runId);
     expect(run.status).toBe('failed');
     const selectStep = (await store.listSteps(runId)).find((s) => s.nodeId === 'n_dec');
-    expect(selectStep?.errorCode).toBe('unauthorized_effect');
+    expect(selectStep?.errorCode).toBe('invalid_reference');
   });
 
-  it('accepts links whose relationConsId is an active relation type', async () => {
+  it('accepts links whose existing relation ref is an active relation type', async () => {
     const llm = createMockLlm(() => linkedOutput);
     const { deps, runId } = await setupContentHarness(llm, true);
     const run = await executeRun(deps, runId);
@@ -749,7 +770,7 @@ describe('§4.1/§12 llm_attempts logging', () => {
     const events = await store.listEvents(runId);
     const called = events.find((e) => e.eventType === 'llm_called');
     const payload = called?.payload as Record<string, unknown>;
-    expect(payload['promptTemplateVersion']).toBe('v1');
+    expect(payload['promptTemplateVersion']).toBe('v2');
     expect(payload['model']).toBe('mock');
     expect(payload['maxOutputTokens']).toBe(4096);
     expect(payload['stepId']).toBe(`${runId}::n_select`);
@@ -1015,7 +1036,7 @@ describe('tempId namespace enforcement', () => {
 
   it('accepts artifact tempIds that do not collide with any cons id', async () => {
     const llm = createMockLlm(() => ({
-      artifacts: [{ tempId: 'fresh-temp-1', kind: 'object', content: { title: '正常对象' } }],
+      artifacts: [{ tempId: 'fresh-temp-1', kind: 'object', content: { title: '正常对象', body: '正常对象正文。' } }],
       links: [],
       executionSummary: '正常输出。',
     }));

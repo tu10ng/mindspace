@@ -50,11 +50,11 @@ const envelope: ExecutionEnvelope = {
 };
 
 describe('buildPrompts', () => {
-  it('uses the fixed 7-line protocol system prompt verbatim', () => {
+  it('uses the fixed protocol system prompt verbatim', () => {
     const { systemPrompt } = buildPrompts(envelope);
     expect(systemPrompt).toBe(SYSTEM_PROMPT);
-    expect(systemPrompt.split('\n')).toHaveLength(7);
-    expect(systemPrompt).toContain('只返回符合 outputSchema 的 JSON。');
+    expect(systemPrompt).toContain('只返回符合 outputSchema 的单个 JSON 对象。');
+    expect(systemPrompt).toContain('可引用对象集合');
     expect(systemPrompt).not.toContain('草原');
   });
 
@@ -74,11 +74,12 @@ describe('buildPrompts', () => {
     expect(userPrompt).toContain('"status"');
   });
 
-  it('omits method section when no method provided', () => {
+  it('omits method and tendency sections when none provided while keeping available references', () => {
     const bare: ExecutionEnvelope = { ...envelope, method: undefined, tendencies: [] };
     const { userPrompt } = buildPrompts(bare);
     expect(userPrompt).not.toContain('## 方法');
-    expect(userPrompt).not.toContain('## 倾向');
-    expect(userPrompt).toContain('## 候选');
+    expect(userPrompt).not.toContain('## 倾向详情');
+    expect(userPrompt).toContain('## 可引用对象集合');
+    expect(userPrompt).toContain('availableActions');
   });
 });

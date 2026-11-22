@@ -94,28 +94,39 @@ function makeHandler(lieFreedom = false) {
       const marker = requireCorpusMarker(p, action);
       return {
         artifacts: [
-          { tempId: 'a1', kind: 'object', content: { title: '中心对象' } },
-          { tempId: 'a2', kind: 'proposition', content: { text: '中心对象具有多层位置修饰' } },
+          { tempId: 'a1', kind: 'object', content: { title: '中心对象', body: '输入句子中描述的中心对象。' } },
+          { tempId: 'a2', kind: 'proposition', content: { title: '位置修饰命题', body: '中心对象具有多层位置修饰。' } },
         ],
-        links: [],
+        links: [
+          { fromTempId: 'a2', relation: { kind: 'existing', ref: { consId: 'rel.describes', revision: 1 } }, toTempId: 'a1' },
+        ],
         executionSummary: `拆解了输入句子的组成与位置关系。${EXEC_SUMMARY_PREFIX}${marker}`,
       };
+    }
+    if (action === 'seed.resolve_entities') {
+      const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
+      const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
+      const resolutions = artifacts
+        .filter((a) => a['kind'] === 'object' || a['kind'] === 'concept')
+        .map((a) => ({
+          tempId: String(a['tempId'] ?? ''),
+          decision: 'create',
+          basis: 'mock 默认新建局部对象。',
+        }));
+      return { status: 'resolved', resolutions };
+    }
+    if (action === 'seed.associate_context') {
+      return { associations: [] };
     }
     if (action === 'seed.prepare_connections') {
       const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
       const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
       return {
-        candidates: artifacts.map((a) => ({
+        metadata: artifacts.map((a) => ({
           tempId: typeof a['tempId'] === 'string' ? a['tempId'] : '',
-          kind: typeof a['kind'] === 'string' ? a['kind'] : 'object',
-          content: {
-            title: typeof a['title'] === 'string' ? a['title'] : (isRec(a['content']) && typeof a['content']['title'] === 'string' ? a['content']['title'] : '产物'),
-            aliases: [],
-            searchTerms: ['对象'],
-            applicabilityText: '',
-          },
+          aliases: [],
+          searchTerms: ['对象'],
         })),
-        edges: [],
       };
     }
     if (action === 'seed.extract_method') {
@@ -125,29 +136,14 @@ function makeHandler(lieFreedom = false) {
       if (methodUsed !== undefined && methodUsed.consId === 'seed.decompose.default') {
         return {
           status: 'proposed',
-          title: M1_TITLE,
-          actionId: 'seed.decompose',
-          applicabilityText: '包含多层位置修饰的句子',
-          instructions: M1_INSTRUCTIONS,
-          aliases: ['嵌套位置'],
-          searchTerms: ['嵌套', '位置', '上的', '句子拆解'],
-          sourceCaseId: '',
-          candidates: [
-            {
-              tempId: 'method-1',
-              kind: 'method',
-              content: {
-                title: M1_TITLE,
-                aliases: ['嵌套位置'],
-                searchTerms: ['嵌套', '位置', '上的', '句子拆解'],
-                applicabilityText: '包含多层位置修饰的句子',
-                instructions: M1_INSTRUCTIONS,
-                body: M1_INSTRUCTIONS,
-                spec: { kind: 'method', actionId: 'seed.decompose', instructions: M1_INSTRUCTIONS, applicabilityText: '包含多层位置修饰的句子' },
-              },
-            },
-          ],
-          methodBindings: [{ actionId: 'seed.decompose', methodRef: 'method-1' }],
+          method: {
+            title: M1_TITLE,
+            actionId: 'seed.decompose',
+            applicabilityText: '包含多层位置修饰的句子',
+            instructions: M1_INSTRUCTIONS,
+            aliases: ['嵌套位置'],
+            searchTerms: ['嵌套', '位置', '上的', '句子拆解'],
+          },
         };
       }
       return { status: 'none' };
@@ -157,33 +153,16 @@ function makeHandler(lieFreedom = false) {
       if (input['usedDefaultFreedom'] === true) {
         return {
           status: 'proposed',
-          title: T1_TITLE,
-          scope: 'action_selection',
-          applicabilityText: '包含多层“上的”结构的句子',
-          preferenceText: '优先考虑拆解',
-          preferIds: [],
-          avoidIds: [],
-          candidates: [
-            {
-              tempId: 'tendency-1',
-              kind: 'tendency',
-              content: {
-                title: T1_TITLE,
-                aliases: [],
-                searchTerms: [T1_TITLE],
-                applicabilityText: '包含多层“上的”结构的句子',
-                preferenceText: '优先考虑拆解',
-                spec: {
-                  kind: 'tendency',
-                  scope: 'action_selection',
-                  applicabilityText: '包含多层“上的”结构的句子',
-                  preferenceText: '优先考虑拆解',
-                  preferIds: [],
-                  avoidIds: [],
-                },
-              },
-            },
-          ],
+          tendency: {
+            title: T1_TITLE,
+            scope: 'action_selection',
+            applicabilityText: '包含多层“上的”结构的句子',
+            preferenceText: '优先考虑拆解',
+            preferIds: [],
+            avoidIds: [],
+            aliases: [],
+            searchTerms: [T1_TITLE],
+          },
         };
       }
       return { status: 'none' };
@@ -318,7 +297,7 @@ describe('§17.2 core internalization loop across two runs', () => {
     expect(llm.calls.filter((c) => actionConsId(c.userPrompt) === 'seed.decompose')).toHaveLength(2);
     expect(llm.calls.filter((c) => actionConsId(c.userPrompt) === 'seed.extract_method')).toHaveLength(2);
     expect(llm.calls.filter((c) => actionConsId(c.userPrompt) === 'seed.extract_tendency')).toHaveLength(1);
-    expect(llm.calls).toHaveLength(13);
+    expect(llm.calls).toHaveLength(17);
     const steps1 = await app.store.listSteps(run1.id);
     expect(steps1.filter((s) => s.actionRef.consId === 'seed.receive')).toHaveLength(1);
   });
@@ -337,6 +316,7 @@ describe('§17.1-7 corpus cannot change scheduling', () => {
       expect(nodeIds).toEqual([
         'receive',
         'make_query',
+        'retrieve_context',
         'search_actions',
         'search_action_tendencies',
         'select_action',
@@ -344,13 +324,15 @@ describe('§17.1-7 corpus cannot change scheduling', () => {
         'search_method_tendencies',
         'select_method',
         'execute_action',
+        'search_resolution_tendencies',
+        'resolve_entities',
+        'associate_context',
         'prepare_connections',
-        'form_content',
-        'connect_content',
+        'materialize_and_connect',
         'record_case',
         'internalize',
       ]);
-      expect(advLlm.calls).toHaveLength(7);
+      expect(advLlm.calls).toHaveLength(9);
       expect(advLlm.calls.every((c) => c.systemPrompt.includes('不得自行调用其他动作'))).toBe(true);
     } finally {
       advApp.close();

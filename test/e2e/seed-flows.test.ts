@@ -49,57 +49,44 @@ function selection(status: string, selected: ConsRef | null, freedom: boolean): 
 }
 
 function defineActionOutput(): Record<string, unknown> {
-  const executor = defineMode === 'llm' ? 'llm' : 'primitive';
-  const specExtras: Record<string, unknown> = defineMode === 'llm' ? {} : { primitiveKey: 'form' };
+  if (defineMode === 'primitive') {
+    // Attempt to declare unauthorized primitive executor fields; schema rejects it at the boundary.
+    return {
+      status: 'proposed',
+      action: {
+        title: NEW_ACTION_TITLE,
+        body: '尝试绑定原语的违规动作。',
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        executor: 'primitive',
+        primitiveKey: 'form',
+        freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
+        defaultMethod: {
+          title: '违规默认方法',
+          instructions: '逐项对比两个对象。',
+          applicabilityText: '需要比较两个对象时。',
+        },
+      },
+    };
+  }
   return {
     status: 'proposed',
-    title: NEW_ACTION_TITLE,
-    description: '比较两个对象的共同点与差异',
-    inputSchema: { type: 'object' },
-    outputSchema: { type: 'object' },
-    freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
-    defaultMethod: { title: '比较对象默认方法', instructions: '逐项对比两个对象。', applicabilityText: '需要比较两个对象时。' },
-    artifacts: [
-      {
-        tempId: 'action-1',
-        kind: 'action',
-        content: {
-          title: NEW_ACTION_TITLE,
-          body: '比较两个对象的共同点与差异',
-          aliases: ['比较'],
-          searchTerms: ['比较', '对象'],
-          spec: {
-            kind: 'action',
-            inputSchema: { type: 'object' },
-            outputSchema: { type: 'object' },
-            executor,
-            allowedEffects: defineMode === 'llm' ? ['return_artifacts'] : ['read', 'create_draft'],
-            freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
-            defaultMethodId: 'method-1',
-            ...specExtras,
-          },
-        },
+    action: {
+      title: NEW_ACTION_TITLE,
+      body: '比较两个对象的共同点与差异。',
+      aliases: ['比较'],
+      searchTerms: ['比较', '对象'],
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      freedom: { chooseWithinCandidates: false, fillExecutionDetails: true, proposeNewDefinitions: false },
+      defaultMethod: {
+        title: '比较对象默认方法',
+        instructions: '逐项对比两个对象的属性，输出共同点与差异。',
+        applicabilityText: '需要比较两个对象时。',
+        aliases: [],
+        searchTerms: ['比较', '默认方法'],
       },
-      {
-        tempId: 'method-1',
-        kind: 'method',
-        content: {
-          title: '比较对象默认方法',
-          body: '逐项对比两个对象的属性，输出共同点与差异。',
-          aliases: [],
-          searchTerms: ['比较', '默认方法'],
-          applicabilityText: '需要比较两个对象时。',
-          instructions: '逐项对比两个对象的属性，输出共同点与差异。',
-          spec: {
-            kind: 'method',
-            actionId: 'action-1',
-            instructions: '逐项对比两个对象的属性，输出共同点与差异。',
-            applicabilityText: '需要比较两个对象时。',
-          },
-        },
-      },
-    ],
-    methodBindings: [{ actionId: 'action-1', methodRef: 'method-1' }],
+    },
   };
 }
 
@@ -130,23 +117,37 @@ function makeHandler() {
       const marker = requireCorpusMarker(p, action);
       return {
         artifacts: [
-          { tempId: 'a1', kind: 'object', content: { title: '中心对象' } },
-          { tempId: 'a2', kind: 'proposition', content: { text: '中心对象具有多层位置修饰' } },
+          { tempId: 'a1', kind: 'object', content: { title: '中心对象', body: '输入中的中心对象。' } },
+          { tempId: 'a2', kind: 'proposition', content: { title: '位置修饰命题', body: '中心对象具有多层位置修饰。' } },
         ],
-        links: [],
+        links: [
+          { fromTempId: 'a2', relation: { kind: 'existing', ref: { consId: 'rel.describes', revision: 1 } }, toTempId: 'a1' },
+        ],
         executionSummary: `拆解了输入句子的组成与位置关系。${EXEC_SUMMARY_PREFIX}${marker}`,
       };
+    }
+    if (action === 'seed.resolve_entities') {
+      const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
+      const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
+      return {
+        status: 'resolved',
+        resolutions: artifacts
+          .filter((a) => a['kind'] === 'object' || a['kind'] === 'concept')
+          .map((a) => ({ tempId: String(a['tempId'] ?? ''), decision: 'create', basis: 'mock create' })),
+      };
+    }
+    if (action === 'seed.associate_context') {
+      return { associations: [] };
     }
     if (action === 'seed.prepare_connections') {
       const artifactsBlock = jsonBlocks(p).find((b) => 'artifacts' in b) ?? {};
       const artifacts = Array.isArray(artifactsBlock['artifacts']) ? (artifactsBlock['artifacts'] as Array<Record<string, unknown>>) : [];
       return {
-        candidates: artifacts.map((a) => ({
+        metadata: artifacts.map((a) => ({
           tempId: typeof a['tempId'] === 'string' ? a['tempId'] : '',
-          kind: typeof a['kind'] === 'string' ? a['kind'] : 'object',
-          content: a['content'],
+          aliases: [],
+          searchTerms: ['对象'],
         })),
-        edges: [],
       };
     }
     if (action === 'seed.extract_method') {
@@ -156,29 +157,14 @@ function makeHandler() {
       if (methodUsed !== undefined && methodUsed.consId === 'seed.decompose.default') {
         return {
           status: 'proposed',
-          title: M1_TITLE,
-          actionId: 'seed.decompose',
-          applicabilityText: '包含多层位置修饰的句子',
-          instructions: M1_INSTRUCTIONS,
-          aliases: ['嵌套位置'],
-          searchTerms: ['嵌套', '位置'],
-          sourceCaseId: '',
-          candidates: [
-            {
-              tempId: 'method-1',
-              kind: 'method',
-              content: {
-                title: M1_TITLE,
-                aliases: ['嵌套位置'],
-                searchTerms: ['嵌套', '位置'],
-                applicabilityText: '包含多层位置修饰的句子',
-                instructions: M1_INSTRUCTIONS,
-                body: M1_INSTRUCTIONS,
-                spec: { kind: 'method', actionId: 'seed.decompose', instructions: M1_INSTRUCTIONS, applicabilityText: '包含多层位置修饰的句子' },
-              },
-            },
-          ],
-          methodBindings: [{ actionId: 'seed.decompose', methodRef: 'method-1' }],
+          method: {
+            title: M1_TITLE,
+            actionId: 'seed.decompose',
+            applicabilityText: '包含多层位置修饰的句子',
+            instructions: M1_INSTRUCTIONS,
+            aliases: ['嵌套位置'],
+            searchTerms: ['嵌套', '位置'],
+          },
         };
       }
       return { status: 'none' };
@@ -338,16 +324,8 @@ describe('seed flow.define_action §11.1', () => {
     expect(run.status).toBe('failed');
     const steps = await store.listSteps(run.id);
     const failed = steps.find((s) => s.status === 'failed');
-    expect(failed?.errorCode).toBe('unauthorized_effect');
-    const formed = (run.state['formedAction'] as { formed: Array<{ tempId: string; consRef: ConsRef }> }).formed;
-    for (const f of formed) {
-      const rev = await store.getRevision(f.consRef.consId, f.consRef.revision);
-      if (rev?.roles.includes('action')) {
-        const cons = await store.getCons(f.consRef.consId);
-        expect(cons?.status).toBe('draft');
-        expect(await store.getActiveExecutionBinding(f.consRef.consId)).toBeNull();
-      }
-    }
+    expect(failed?.errorCode).toBe('schema_mismatch');
+    expect(run.state['formedAction']).toBeUndefined();
     defineMode = 'llm';
   });
 });

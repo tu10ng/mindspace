@@ -1,7 +1,7 @@
 import type {
   Cons, ConsRef, ConsRevision, ConsEdge, ExecutionBinding, MethodBinding,
   Run, RunAuthorization, Step, EventRecord, SearchQuery, SearchResponse, ConsRole, ConsStatus,
-  GraphSnapshot, RunSummary,
+  GraphSnapshot, RunSummary, TrustedSnapshot, SearchResultItem,
 } from '../types.js';
 import type { LlmAttemptRow } from '../engine/llm_log.js';
 
@@ -14,6 +14,9 @@ export interface ConsStoreApi {
   activateRevision(consId: string, revision: number): Promise<void>;
 
   createEdge(edge: Omit<ConsEdge, 'id'>): Promise<ConsEdge>;
+  findActiveEdge(from: ConsRef, relationConsId: string, to: ConsRef): Promise<ConsEdge | null>;
+  addEdgeEvidence(edgeId: string, evidenceRefs: ConsRef[], createdByStepId?: string): Promise<void>;
+  listEdgeEvidence(edgeId: string): Promise<ConsRef[]>;
   listEdges(consId: string, direction?: 'from' | 'to' | 'both', onlyActive?: boolean): Promise<ConsEdge[]>;
   archiveEdge(edgeId: string): Promise<void>;
 
@@ -35,6 +38,8 @@ export interface ConsStoreApi {
   getRun(runId: string): Promise<Run | null>;
   putRunAuthorization(runId: string, key: string, record: RunAuthorization): Promise<void>;
   getRunAuthorization(runId: string, key: string): Promise<RunAuthorization | null>;
+  putTrustedSnapshot(runId: string, key: string, stepId: string, payload: unknown): Promise<void>;
+  getTrustedSnapshot<T = unknown>(runId: string, key: string): Promise<TrustedSnapshot<T> | null>;
 
   upsertStep(step: Step): Promise<void>;
   getStep(runId: string, nodeId: string): Promise<Step | null>;
@@ -49,6 +54,8 @@ export interface ConsStoreApi {
 
   search(query: SearchQuery): Promise<SearchResponse>;
   searchByRole(query: SearchQuery, roles: ConsRole[]): Promise<SearchResponse>;
+  /** Find active cons whose title or alias appears verbatim in the given text (pure string matching). */
+  findMentionedCons(text: string, roles: ConsRole[], opts?: { excludeInputProvenance?: boolean; limit?: number }): Promise<SearchResultItem[]>;
   countActiveByRole(role: ConsRole): Promise<number>;
   listActiveConsByRole(role: ConsRole, limit?: number): Promise<Array<{ ref: ConsRef; title: string }>>;
   getGraphSnapshot(): Promise<GraphSnapshot>;

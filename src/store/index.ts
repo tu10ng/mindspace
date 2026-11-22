@@ -24,6 +24,7 @@ import type { ConsStoreApi } from './api.js';
 import { createWriteQueue, openDb, type StoreDb, type WriteQueue } from './db.js';
 import {
   countActiveByRoleImpl,
+  findMentionedConsImpl,
   listActiveConsByRoleImpl,
   searchByRoleImpl,
   searchCons,
@@ -272,6 +273,46 @@ export function openStore(path: string): ConsStoreApi {
     reindexSync(consId);
   }
 
+  function listEdgeEvidenceSync(edgeId: string): ConsRef[] {
+    const rows = db
+      .prepare(
+        `SELECT evidence_cons_id, evidence_revision
+         FROM cons_edge_evidence
+         WHERE edge_id = ?
+         ORDER BY created_at ASC, evidence_cons_id ASC, evidence_revision ASC`,
+      )
+      .all(edgeId) as Row[];
+    return rows.map((r) => ({
+      consId: r.evidence_cons_id as string,
+      revision: r.evidence_revision as number,
+    }));
+  }
+
+  function addEdgeEvidenceSync(edgeId: string, evidenceRefs: ConsRef[], createdByStepId?: string): void {
+    const createdAt = nowIso();
+    const stmt = db.prepare(
+      `INSERT OR IGNORE INTO cons_edge_evidence (edge_id, evidence_cons_id, evidence_revision, created_by_step_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (const ref of evidenceRefs) {
+      if (!Number.isInteger(ref.revision) || ref.revision < 1) {
+        throw unknownReference(`unknown_reference: edge evidence ${ref.consId}@${String(ref.revision)} has an invalid revision`);
+      }
+      const rev = db.prepare('SELECT 1 FROM cons_revisions WHERE cons_id = ? AND revision = ?').get(ref.consId, ref.revision);
+      if (rev === undefined) {
+        throw unknownReference(`unknown_reference: edge evidence revision ${ref.consId}@${String(ref.revision)} not found`);
+      }
+      stmt.run(edgeId, ref.consId, ref.revision, createdByStepId ?? null, createdAt);
+    }
+  }
+
+  function hydrateEdgesSync(edges: ConsEdge[]): ConsEdge[] {
+    return edges.map((e) => {
+      const evidenceRefs = listEdgeEvidenceSync(e.id);
+      return evidenceRefs.length > 0 ? { ...e, evidenceRefs } : e;
+    });
+  }
+
   return {
     async createCons(revision, opts) {
       return write(() => createConsSync(revision, opts));
@@ -342,7 +383,11 @@ export function openStore(path: string): ConsStoreApi {
           edge.status,
           edge.createdByStepId ?? null,
         );
+        if (edge.evidenceRefs !== undefined && edge.evidenceRefs.length > 0) {
+          addEdgeEvidenceSync(id, edge.evidenceRefs, edge.createdByStepId);
+        }
         insertEventSync('edges_created', { edgeId: id, relationConsId: edge.relationConsId }, null, null);
+        const evidenceRefs = listEdgeEvidenceSync(id);
         return {
           id,
           from: edge.from,
@@ -350,8 +395,36 @@ export function openStore(path: string): ConsStoreApi {
           to: edge.to,
           ...(edge.createdByStepId !== undefined ? { createdByStepId: edge.createdByStepId } : {}),
           status: edge.status,
+          ...(evidenceRefs.length > 0 ? { evidenceRefs } : {}),
         };
       });
+    },
+
+    async findActiveEdge(from, relationConsId, to) {
+      return write(() => {
+        const row = db
+          .prepare(
+            `SELECT * FROM cons_edges
+             WHERE from_id = ? AND from_revision = ? AND relation_cons_id = ? AND to_id = ? AND to_revision = ? AND status = 'active'
+             ORDER BY rowid ASC LIMIT 1`,
+          )
+          .get(from.consId, from.revision, relationConsId, to.consId, to.revision) as Row | undefined;
+        if (row === undefined) return null;
+        const edge = rowToEdge(row);
+        const evidenceRefs = listEdgeEvidenceSync(edge.id);
+        return evidenceRefs.length > 0 ? { ...edge, evidenceRefs } : edge;
+      });
+    },
+
+    async addEdgeEvidence(edgeId, evidenceRefs, createdByStepId) {
+      return write(() => {
+        if (evidenceRefs.length === 0) return;
+        addEdgeEvidenceSync(edgeId, evidenceRefs, createdByStepId);
+      });
+    },
+
+    async listEdgeEvidence(edgeId) {
+      return write(() => listEdgeEvidenceSync(edgeId));
     },
 
     async listEdges(consId, direction, onlyActive) {
@@ -370,7 +443,7 @@ export function openStore(path: string): ConsStoreApi {
         }
         const where = `(${clauses.join(' OR ')})${active ? " AND status = 'active'" : ''}`;
         const rows = db.prepare(`SELECT * FROM cons_edges WHERE ${where} ORDER BY id`).all(...params) as Row[];
-        return rows.map(rowToEdge);
+        return hydrateEdgesSync(rows.map(rowToEdge));
       });
     },
 
@@ -556,6 +629,30 @@ export function openStore(path: string): ConsStoreApi {
       });
     },
 
+    async putTrustedSnapshot(runId, key, stepId, payload) {
+      return write(() => {
+        db.prepare(
+          `INSERT INTO run_trusted_snapshots (run_id, key, step_id, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (run_id, key) DO UPDATE SET
+             step_id = excluded.step_id,
+             payload_json = excluded.payload_json`,
+        ).run(runId, key, stepId, JSON.stringify(payload ?? null), nowIso());
+      });
+    },
+
+    async getTrustedSnapshot<T = unknown>(runId: string, key: string) {
+      return write(() => db
+        .prepare('SELECT * FROM run_trusted_snapshots WHERE run_id = ? AND key = ?')
+        .get(runId, key) as Row | undefined).then((row) => {
+        if (row === undefined) return null;
+        return {
+          stepId: row.step_id as string,
+          payload: JSON.parse(row.payload_json as string) as T,
+        };
+      });
+    },
+
     async upsertStep(step) {
       return write(() => {
         db.prepare(
@@ -668,6 +765,10 @@ export function openStore(path: string): ConsStoreApi {
       return write(() => searchByRoleImpl(ctx, query, roles));
     },
 
+    async findMentionedCons(text, roles, opts) {
+      return write(() => findMentionedConsImpl(ctx, text, roles, opts));
+    },
+
     async countActiveByRole(role) {
       return write(() => countActiveByRoleImpl(ctx, role));
     },
@@ -714,7 +815,7 @@ export function openStore(path: string): ConsStoreApi {
         const edgeRows = db
           .prepare('SELECT * FROM cons_edges ORDER BY rowid ASC')
           .all() as Row[];
-        const edges = edgeRows.map(rowToEdge);
+        const edges = hydrateEdgesSync(edgeRows.map(rowToEdge));
         return { nodes, edges };
       });
     },
