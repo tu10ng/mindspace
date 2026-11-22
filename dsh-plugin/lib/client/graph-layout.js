@@ -36,6 +36,52 @@ function truncateLabel(text, max = 34) {
   return `${clean.slice(0, max - 1)}…`
 }
 
+function rectEdgePoint(box, targetX, targetY, gap = 6) {
+  const cx = box.x + box.width / 2
+  const cy = box.y + box.height / 2
+  const dx = targetX - cx
+  const dy = targetY - cy
+  const len = Math.hypot(dx, dy)
+  if (len < 1e-6) return { x: cx, y: cy }
+  const hw = box.width / 2
+  const hh = box.height / 2
+  const scale = Math.min(
+    Math.abs(dx) > 1e-6 ? hw / Math.abs(dx) : Infinity,
+    Math.abs(dy) > 1e-6 ? hh / Math.abs(dy) : Infinity,
+  )
+  return {
+    x: cx + dx * scale + (dx / len) * gap,
+    y: cy + dy * scale + (dy / len) * gap,
+  }
+}
+
+function computeArrowEndpoints(fromBox, toBox) {
+  const fromCx = fromBox.x + fromBox.width / 2
+  const fromCy = fromBox.y + fromBox.height / 2
+  const toCx = toBox.x + toBox.width / 2
+  const toCy = toBox.y + toBox.height / 2
+  const startPt = rectEdgePoint(fromBox, toCx, toCy, 6)
+  const endPt = rectEdgePoint(toBox, fromCx, fromCy, 6)
+  const vx = toCx - fromCx
+  const vy = toCy - fromCy
+  const dx = endPt.x - startPt.x
+  const dy = endPt.y - startPt.y
+  if (dx * vx + dy * vy <= 0) {
+    return {
+      x: fromCx,
+      y: fromCy,
+      dx: toCx - fromCx,
+      dy: toCy - fromCy,
+    }
+  }
+  return {
+    x: startPt.x,
+    y: startPt.y,
+    dx,
+    dy,
+  }
+}
+
 function overlapsAny(x, y, width, height, occupied) {
   const pad = 28
   for (const box of occupied) {
@@ -282,11 +328,18 @@ export function buildSceneElements({ graph, savedPositions, highlightNodeIds, co
       continue
     }
 
+    const arrowGeom = computeArrowEndpoints(fromBox, toBox)
     skeletons.push({
       id: `${EDGE_PREFIX}${edge.id}`,
       type: 'arrow',
-      x: fromBox.x + fromBox.width / 2,
-      y: fromBox.y + fromBox.height / 2,
+      x: arrowGeom.x,
+      y: arrowGeom.y,
+      width: Math.abs(arrowGeom.dx),
+      height: Math.abs(arrowGeom.dy),
+      points: [
+        [0, 0],
+        [arrowGeom.dx, arrowGeom.dy],
+      ],
       start: { id: `${NODE_PREFIX}${fromId}` },
       end: { id: `${NODE_PREFIX}${toId}` },
       strokeColor: '#64748b',
